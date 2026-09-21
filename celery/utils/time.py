@@ -476,9 +476,17 @@ def get_exponential_backoff_interval(
     factor: int,
     retries: int,
     maximum: int,
-    full_jitter: bool = False
+    full_jitter: bool = False,
+    max_retries: int | None = None,
 ) -> int:
-    """Calculate the exponential backoff wait time."""
+    """Calculate the exponential backoff wait time.
+
+    The backoff is bounded in two ways: the ``maximum`` argument caps the
+    absolute wait time, and ``max_retries`` (when given) caps the exponent,
+    so the delay stops growing once the retry budget is exhausted.
+    """
+    if max_retries is not None:
+        retries = min(retries, max_retries)
     # Will be zero if factor equals 0
     countdown = min(maximum, factor * (2 ** retries))
     # Full jitter according to

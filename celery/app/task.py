@@ -825,6 +825,15 @@ class Task:
                 This always happens, unless the `throw` keyword argument
                 has been explicitly set to :const:`False`, and is considered
                 normal operation.
+
+        Note:
+            The retried message carries over the request metadata
+            (task id, retry counter, delivery info) of the current
+            request.  If publishing the retry message fails (e.g. the
+            broker connection is lost while reconnecting), the message is
+            rejected without requeue and the original exception is kept as
+            the cause of the raised :exc:`~@Reject` error, so the
+            exception chain is preserved.
         """
         request = self.request
         retries = request.retries + 1
@@ -871,8 +880,14 @@ class Task:
 
         try:
             S.apply_async()
-        except Exception as exc:
-            raise Reject(exc, requeue=False)
+        except Exception as publish_exc:
+            # The retry message could not be published (e.g. the broker
+            # connection was lost while reconnecting): reject the message
+            # without requeue, but keep the original exception as the
+            # cause so the exception chain is preserved.
+            if exc is not None:
+                raise Reject(publish_exc, requeue=False) from exc
+            raise Reject(publish_exc, requeue=False)
         if throw:
             raise ret
         return ret

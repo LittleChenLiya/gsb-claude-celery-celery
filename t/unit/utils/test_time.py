@@ -468,3 +468,27 @@ class test_get_exponential_backoff_interval:
         get_exponential_backoff_interval(
             factor=40, retries=10, maximum=maximum, full_jitter=True)
         rr.assert_called_once_with(maximum + 1)
+
+    def test_bounded_by_max_retries(self):
+        # the exponent is capped at max_retries so the delay stops
+        # growing once the retry budget is exhausted.
+        assert get_exponential_backoff_interval(
+            factor=4, retries=10, maximum=10 ** 9, max_retries=3,
+        ) == 4 * (2 ** 3)
+
+    def test_max_retries_none_keeps_exponent(self):
+        assert get_exponential_backoff_interval(
+            factor=4, retries=3, maximum=10 ** 9, max_retries=None,
+        ) == 4 * (2 ** 3)
+
+    def test_max_retries_below_retries_still_bounded_by_maximum(self):
+        assert get_exponential_backoff_interval(
+            factor=4, retries=10, maximum=100, max_retries=10,
+        ) == 100
+
+    @patch('random.randrange', lambda n: n - 2)
+    def test_max_retries_with_jitter(self):
+        assert get_exponential_backoff_interval(
+            factor=4, retries=10, maximum=10 ** 9,
+            full_jitter=True, max_retries=2,
+        ) == 4 * (2 ** 2) - 1

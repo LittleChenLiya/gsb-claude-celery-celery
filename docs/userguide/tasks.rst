@@ -794,6 +794,11 @@ You can also set `autoretry_for`, `max_retries`, `retry_backoff`, `retry_backoff
     delay in seconds between task autoretries. By default, this option is set to ``600``,
     which is 10 minutes.
 
+    The backoff delay is bounded in two ways: this option caps the absolute
+    wait time, and :attr:`~Task.max_retries` caps the exponent, so the delay
+    stops doubling once the retry budget is exhausted (this also keeps the
+    delay sane if a message is redelivered with an inflated retry counter).
+
 .. attribute:: Task.retry_jitter
 
     A boolean. `Jitter`_ is used to introduce randomness into
@@ -1151,6 +1156,26 @@ General
 
     The global default can be overridden by the :setting:`task_acks_late`
     setting.
+
+    .. _task-single-final-state:
+
+    .. note::
+
+        **Single final state guarantee.**  The worker serializes the
+        terminal paths of a task request: an acknowledgement racing a
+        reject (e.g. a success racing a revoke or time limit) performs
+        exactly one broker operation, and a terminal result
+        (``FAILURE``/``REVOKED``) is written to the result backend at
+        most once per request -- even when a hard time limit fires while
+        the pool is reporting the task failure, or a redelivered message
+        finishes after a retry.  If the backend write itself fails (e.g.
+        the result backend is reconnecting), the claim is released so a
+        later failure path can still record the final state.
+
+        ``acks_late`` messages are never acknowledged before the task
+        body has finished: the acknowledgement happens only after the
+        success (or, depending on :attr:`~Task.acks_on_failure` and
+        :attr:`~Task.acks_on_timeout`, the failure) has been recorded.
 
 .. _task-track-started:
 
