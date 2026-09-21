@@ -5,6 +5,7 @@ how tasks are executed.
 """
 import logging
 import sys
+import threading
 from datetime import datetime
 from time import monotonic, time
 from weakref import ref
@@ -76,6 +77,10 @@ class Request:
     _terminate_on_ack = None
     _apply_result = None
     _tzlocal = None
+    #: Set to True once a terminal result (failure/retry/revoked) has been
+    #: claimed for this request, so that racing timeout/failure/revoke
+    #: handlers cannot write duplicate terminal states to the result backend.
+    _terminal_result_claimed = False
 
     #: Timer entry for this request's pending ETA/countdown callback, set by
     #: :mod:`celery.worker.strategy` when the request is scheduled so that
@@ -127,6 +132,10 @@ class Request:
         self._kwargsrepr = self._request_dict.get('kwargsrepr', '')
         self._on_ack = on_ack
         self._on_reject = on_reject
+        # Guards acknowledge()/reject() and the terminal-result claim so
+        # that concurrent pool callbacks, timer threads and shutdown
+        # handlers resolve this request to exactly one final state.
+        self._ack_lock = threading.Lock()
         self._hostname = hostname or gethostname()
         self._eventer = eventer
         self._connection_errors = connection_errors or ()
@@ -449,9 +458,10 @@ class Request:
         if emit_retry:
             reason = 'cancelled by Celery'
             exc = Retry(message=reason)
-            self.task.backend.mark_as_retry(self.id,
-                                            exc,
-                                            request=self._context)
+            if self._claim_terminal_result():
+                self.task.backend.mark_as_retry(self.id,
+                                                exc,
+                                                request=self._context)
 
             self.task.on_retry(exc, self.id, self.args, self.kwargs, None)
 
@@ -464,10 +474,11 @@ class Request:
         task_ready(self)
         self.send_event('task-revoked',
                         terminated=terminated, signum=signum, expired=expired)
-        self.task.backend.mark_as_revoked(
-            self.id, reason, request=self._context,
-            store_result=self.store_errors,
-        )
+        if self._claim_terminal_result():
+            self.task.backend.mark_as_revoked(
+                self.id, reason, request=self._context,
+                store_result=self.store_errors,
+            )
         self.acknowledge()
         self._already_revoked = True
         send_revoked(self.task, request=self._context,
@@ -544,6 +555,14 @@ class Request:
             if not state.should_terminate:
                 error('Hard time limit (%ss) exceeded for %s[%s]', timeout, self.name, self.id)
                 exc = TimeLimitExceeded(timeout)
+
+                # Only the first terminal handler writes the result and
+                # fires the failure hooks: a racing on_failure for the same
+                # request must not produce a duplicate backend write.
+                # The winning handler is responsible for resolving the
+                # acknowledgement of this request.
+                if not self._claim_terminal_result():
+                    return
 
                 self.task.backend.mark_as_failure(
                     self.id, exc, request=self._context,
@@ -680,15 +699,16 @@ class Request:
                 # never run again, so record a terminal FAILURE result and
                 # fire the task_failure signal instead of leaving the task
                 # stuck in PENDING/STARTED forever (Issue #4222).
-                self.task.backend.mark_as_failure(
-                    self.id, exc, request=self._context,
-                    store_result=self.store_errors,
-                )
-                signals.task_failure.send(
-                    sender=self.task, task_id=self.id, exception=exc,
-                    args=self.args, kwargs=self.kwargs,
-                    traceback=exc_info.traceback, einfo=exc_info,
-                )
+                if self._claim_terminal_result():
+                    self.task.backend.mark_as_failure(
+                        self.id, exc, request=self._context,
+                        store_result=self.store_errors,
+                    )
+                    signals.task_failure.send(
+                        sender=self.task, task_id=self.id, exception=exc,
+                        args=self.args, kwargs=self.kwargs,
+                        traceback=exc_info.traceback, einfo=exc_info,
+                    )
                 if send_failed_event:
                     self.send_event(
                         'task-failed',
@@ -732,17 +752,20 @@ class Request:
         # This is a special case where the process would not have had time
         # to write the result.
         if not requeue and (is_worker_lost or not return_ok):
-            # only mark as failure if task has not been requeued
-            self.task.backend.mark_as_failure(
-                self.id, exc, request=self._context,
-                store_result=self.store_errors,
-            )
+            # only mark as failure if the task has not been requeued, and
+            # only if no other terminal handler (e.g. a racing hard time
+            # limit or revocation) already wrote the final state.
+            if self._claim_terminal_result():
+                self.task.backend.mark_as_failure(
+                    self.id, exc, request=self._context,
+                    store_result=self.store_errors,
+                )
 
-            signals.task_failure.send(sender=self.task, task_id=self.id,
-                                      exception=exc, args=self.args,
-                                      kwargs=self.kwargs,
-                                      traceback=exc_info.traceback,
-                                      einfo=exc_info)
+                signals.task_failure.send(sender=self.task, task_id=self.id,
+                                          exception=exc, args=self.args,
+                                          kwargs=self.kwargs,
+                                          traceback=exc_info.traceback,
+                                          einfo=exc_info)
 
         if send_failed_event:
             self.send_event(
@@ -772,15 +795,31 @@ class Request:
 
     def acknowledge(self):
         """Acknowledge task."""
-        if not self.acknowledged:
-            self._on_ack(logger, self._connection_errors)
-            self.acknowledged = True
+        with self._ack_lock:
+            if not self.acknowledged:
+                self._on_ack(logger, self._connection_errors)
+                self.acknowledged = True
 
     def reject(self, requeue=False):
-        if not self.acknowledged:
-            self._on_reject(logger, self._connection_errors, requeue)
-            self.acknowledged = True
-            self.send_event('task-rejected', requeue=requeue)
+        with self._ack_lock:
+            if not self.acknowledged:
+                self._on_reject(logger, self._connection_errors, requeue)
+                self.acknowledged = True
+                self.send_event('task-rejected', requeue=requeue)
+
+    def _claim_terminal_result(self):
+        """Claim the right to write this request's terminal result.
+
+        Returns :const:`True` exactly once per request.  Concurrent
+        handlers (hard time limit, pool error callback, revocation,
+        connection-loss cancellation) use this to guarantee the result
+        backend receives a single terminal state write for the request.
+        """
+        with self._ack_lock:
+            if self._terminal_result_claimed:
+                return False
+            self._terminal_result_claimed = True
+            return True
 
     def info(self, safe=False):
         return {

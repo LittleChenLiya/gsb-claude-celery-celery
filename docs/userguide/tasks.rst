@@ -46,6 +46,17 @@ as...
 If you really want a task to be redelivered in these scenarios you should
 consider enabling the :setting:`task_reject_on_worker_lost` setting.
 
+.. note::
+
+    Acknowledgement and terminal results are resolved exactly once per
+    delivery: if a hard time limit, a pool error callback, a revocation
+    and a connection-loss cancellation race each other for the same
+    request, only the first handler writes the terminal state
+    (:state:`FAILURE`/:state:`REVOKED`/:state:`RETRY`) to the result
+    backend, and the message is either acknowledged or rejected -- never
+    both.  A redelivered message is a new delivery and gets a fresh
+    terminal state of its own.
+
 .. warning::
 
     A task that blocks indefinitely may eventually stop the worker instance
@@ -678,6 +689,39 @@ override this default.
             # overrides the default delay to retry after 1 minute
             raise self.retry(exc=exc, countdown=60)
 
+.. _task-retry-exponential-backoff:
+
+Using exponential backoff for manual retries
+--------------------------------------------
+
+If neither ``countdown`` nor ``eta`` is passed to
+:meth:`Task.retry() <@Task.retry>` and the task enables
+:attr:`~Task.retry_backoff`, the retry delay is computed using
+`exponential backoff`_ instead of :attr:`~Task.default_retry_delay`,
+exactly like automatic retries do:
+
+.. code-block:: python
+
+    @app.task(bind=True, retry_backoff=True, retry_backoff_max=300)
+    def send_twitter_status(self, oauth, tweet):
+        try:
+            twitter = Twitter(oauth)
+            twitter.update_status(tweet)
+        except Twitter.FailWhaleError as exc:
+            raise self.retry(exc=exc)
+
+The backoff delay is always bounded:
+
+- in time, by :attr:`~Task.retry_backoff_max` (and optionally randomized
+  below that bound by :attr:`~Task.retry_jitter`), and
+- in attempts, by :attr:`~Task.max_retries`, after which the original
+  exception is re-raised with its exception chain (``__cause__``) intact.
+
+The retried message also preserves the request metadata of the original
+delivery (task id lineage, headers, routing information and the updated
+``retries`` counter), so redelivered attempts can be correlated with the
+first execution.
+
 .. _task-autoretry:
 
 Automatic retry for known exceptions
@@ -787,6 +831,8 @@ You can also set `autoretry_for`, `max_retries`, `retry_backoff`, `retry_backoff
     will delay 3 seconds, the second will delay 6 seconds, the third will
     delay 12 seconds, the fourth will delay 24 seconds, and so on. By default,
     this option is set to ``False``, and autoretries will not be delayed.
+    The backoff also applies to manual :meth:`Task.retry() <@Task.retry>`
+    calls that do not pass an explicit ``countdown`` or ``eta``.
 
 .. attribute:: Task.retry_backoff_max
 

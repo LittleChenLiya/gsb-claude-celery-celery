@@ -18,6 +18,7 @@ from celery.utils.functional import mattrgetter, maybe_list
 from celery.utils.imports import instantiate
 from celery.utils.nodenames import gethostname
 from celery.utils.serialization import raise_with_context
+from celery.utils.time import get_exponential_backoff_interval
 
 from .annotations import resolve_all as resolve_all_annotations
 from .registry import _unpickle_task_v2
@@ -243,6 +244,20 @@ class Task:
     #: Default time in seconds before a retry of the task should be
     #: executed.  3 minutes by default.
     default_retry_delay = 3 * 60
+
+    #: If enabled, retries of this task use an exponential backoff delay
+    #: instead of :attr:`default_retry_delay`.  Can be :const:`True` (backoff
+    #: factor of 1) or a number used as the backoff factor.  The delay is
+    #: always capped by :attr:`retry_backoff_max`, and the number of attempts
+    #: is still bounded by :attr:`max_retries`.
+    retry_backoff = False
+
+    #: Maximum number of seconds a backoff retry may be delayed.
+    retry_backoff_max = 600
+
+    #: If enabled, full jitter is applied to the exponential backoff delay
+    #: (a random value between 0 and the computed delay is used).
+    retry_jitter = True
 
     #: Rate limit for this task type.  Examples: :const:`None` (no rate
     #: limit), `'100/s'` (hundred tasks a second), `'100/m'` (hundred tasks
@@ -840,7 +855,18 @@ class Task:
             raise_with_context(exc or Retry('Task can be retried', None))
 
         if not eta and countdown is None:
-            countdown = self.default_retry_delay
+            if self.retry_backoff:
+                # Exponential backoff, always bounded by
+                # ``retry_backoff_max`` (time cap) and, below, by
+                # ``max_retries`` (attempt cap).
+                countdown = get_exponential_backoff_interval(
+                    factor=int(max(1.0, float(self.retry_backoff))),
+                    retries=request.retries,
+                    maximum=self.retry_backoff_max,
+                    full_jitter=self.retry_jitter,
+                )
+            else:
+                countdown = self.default_retry_delay
 
         is_eager = request.is_eager
         S = self.signature_from_request(
