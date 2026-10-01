@@ -79,8 +79,8 @@ __all__ = (
     # Task related errors.
     'TaskError', 'QueueNotFound', 'IncompleteStream',
     'NotRegistered', 'AlreadyRegistered', 'TimeoutError',
-    'MaxRetriesExceededError', 'TaskRevokedError',
-    'InvalidTaskError', 'ChordError',
+    'MaxRetriesExceededError', 'RetryDeadlineExceededError',
+    'TaskRevokedError', 'InvalidTaskError', 'ChordError',
 
     # Backend related errors.
     'BackendError', 'BackendGetMetaError', 'BackendStoreError',
@@ -251,6 +251,20 @@ class MaxRetriesExceededError(TaskError):
     def __init__(self, *args, **kwargs):
         self.task_args = kwargs.pop("task_args", [])
         self.task_kwargs = kwargs.pop("task_kwargs", dict())
+        super().__init__(*args, **kwargs)
+
+
+class RetryDeadlineExceededError(TaskError):
+    """The task's auto-retry absolute deadline has been exceeded.
+
+    Raised instead of re-queueing the task when the optional
+    ``retry_deadline`` of the auto-retry behaviour has passed.
+    """
+
+    def __init__(self, *args, **kwargs):
+        self.task_args = kwargs.pop("task_args", [])
+        self.task_kwargs = kwargs.pop("task_kwargs", dict())
+        self.deadline = kwargs.pop("deadline", None)
         super().__init__(*args, **kwargs)
 
 

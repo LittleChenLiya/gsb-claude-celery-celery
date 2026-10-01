@@ -752,7 +752,7 @@ via options documented below.
 
 .. versionadded:: 4.4
 
-You can also set `autoretry_for`, `max_retries`, `retry_backoff`, `retry_backoff_max` and `retry_jitter` options in class-based tasks:
+You can also set `autoretry_for`, `max_retries`, `retry_backoff`, `retry_backoff_max`, `retry_jitter` and `retry_deadline` options in class-based tasks:
 
 .. code-block:: python
 
@@ -802,6 +802,19 @@ You can also set `autoretry_for`, `max_retries`, `retry_backoff`, `retry_backoff
     value calculated by :attr:`~Task.retry_backoff` is treated as a maximum,
     and the actual delay value will be a random number between zero and that
     maximum. By default, this option is set to ``True``.
+
+.. attribute:: Task.retry_deadline
+
+    An absolute point in time, given as a :class:`~datetime.datetime`
+    (naive values are assumed to be UTC) or as a POSIX timestamp.
+    If set, the task won't be re-queued once the current time reaches
+    the deadline: the auto-retry behaviour raises
+    :exc:`celery.exceptions.RetryDeadlineExceededError` instead, with the
+    original exception chained as its cause. Reaching the exact deadline
+    doesn't issue one more retry. The :attr:`~Task.max_retries` limit
+    keeps its precedence: if it's exhausted first (or at the same time),
+    the usual max-retries-exceeded path is taken. By default, this option
+    is set to ``None`` (no deadline).
 
 .. versionadded:: 5.3.0
 

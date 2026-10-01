@@ -1,6 +1,6 @@
 import socket
 import tempfile
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import ANY, MagicMock, Mock, patch, sentinel
 
 import pytest
@@ -11,7 +11,9 @@ from celery import Task, chain, chord, group, uuid
 from celery.app.task import _reprtask
 from celery.canvas import StampingVisitor, signature
 from celery.contrib.testing.mocks import ContextMock
-from celery.exceptions import CDeprecationWarning, Ignore, ImproperlyConfigured, Retry
+from celery.exceptions import (
+    CDeprecationWarning, Ignore, ImproperlyConfigured, Retry, RetryDeadlineExceededError,
+)
 from celery.result import AsyncResult, EagerResult
 from celery.utils.serialization import UnpickleableExceptionWrapper
 
@@ -877,6 +879,151 @@ class test_task_retries(TasksCase):
 
         # First retry should have countdown=1 (first attempt backoff)
         assert fake_retry_b.call_args_list[0][1]['countdown'] == 1
+
+
+class test_autoretry_deadline(TasksCase):
+    """Tests for the optional absolute auto-retry deadline."""
+
+    FROZEN_NOW = datetime(2026, 10, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+    def _deadline_task(self, **options):
+        @self.app.task(bind=True, shared=False,
+                       autoretry_for=(ZeroDivisionError,), **options)
+        def deadline_task(self_, x, y):
+            self_.iterations += 1
+            return x / y
+
+        deadline_task.iterations = 0
+        return deadline_task
+
+    def _frozen_clock(self):
+        # Locally controllable frozen clock fixture: pin the autoretry
+        # clock to FROZEN_NOW for the duration of the test.
+        return patch('celery.app.autoretry._utcnow',
+                     return_value=self.FROZEN_NOW)
+
+    def test_deadline_not_reached_retries_normally(self):
+        task = self._deadline_task(
+            max_retries=3,
+            retry_deadline=self.FROZEN_NOW + timedelta(hours=1),
+        )
+        with self._frozen_clock(), \
+                patch.object(task, 'retry', wraps=task.retry) as fake_retry:
+            result = task.apply((1, 0))
+
+        # 1 initial attempt + 3 retries, then max_retries is exhausted.
+        assert task.iterations == 4
+        assert fake_retry.call_count == 4
+        with pytest.raises(ZeroDivisionError):
+            result.get()
+
+    def test_deadline_exactly_at_boundary_issues_no_extra_retry(self):
+        task = self._deadline_task(
+            max_retries=3,
+            retry_deadline=self.FROZEN_NOW,
+        )
+        with self._frozen_clock(), \
+                patch.object(task, 'retry', wraps=task.retry) as fake_retry:
+            result = task.apply((1, 0))
+
+        # Hitting the exact deadline must not issue one more retry.
+        assert task.iterations == 1
+        assert fake_retry.call_count == 0
+        with pytest.raises(RetryDeadlineExceededError):
+            result.get()
+
+    def test_deadline_passed_reports_termination_reason(self):
+        task = self._deadline_task(
+            max_retries=3,
+            retry_deadline=self.FROZEN_NOW - timedelta(seconds=1),
+        )
+        with self._frozen_clock(), \
+                patch.object(task, 'retry', wraps=task.retry) as fake_retry:
+            result = task.apply((1, 0))
+
+        assert task.iterations == 1
+        assert fake_retry.call_count == 0
+        with pytest.raises(RetryDeadlineExceededError) as exc_info:
+            result.get()
+        err = exc_info.value
+        # The termination reason is reported, not re-queued.
+        assert 'auto-retry deadline' in str(err)
+        assert err.task_args == (1, 0)
+        assert err.task_kwargs == {}
+        assert err.deadline == (
+            self.FROZEN_NOW - timedelta(seconds=1)).timestamp()
+        # The original exception is chained as the cause.
+        assert isinstance(err.__cause__, ZeroDivisionError)
+
+    def test_max_retries_exhausted_before_deadline(self):
+        task = self._deadline_task(
+            max_retries=1,
+            retry_deadline=self.FROZEN_NOW + timedelta(hours=1),
+        )
+        with self._frozen_clock(), \
+                patch.object(task, 'retry', wraps=task.retry) as fake_retry:
+            result = task.apply((1, 0))
+
+        # max_retries wins first: the original exception propagates.
+        assert task.iterations == 2
+        assert fake_retry.call_count == 2
+        with pytest.raises(ZeroDivisionError):
+            result.get()
+
+    def test_max_retries_takes_precedence_over_passed_deadline(self):
+        task = self._deadline_task(
+            max_retries=0,
+            retry_deadline=self.FROZEN_NOW - timedelta(seconds=1),
+        )
+        with self._frozen_clock(), \
+                patch.object(task, 'retry', wraps=task.retry) as fake_retry:
+            result = task.apply((1, 0))
+
+        # Both limits are exceeded: max_retries keeps its priority and
+        # the task is not reported as deadline-terminated.
+        assert task.iterations == 1
+        assert fake_retry.call_count == 1
+        with pytest.raises(ZeroDivisionError):
+            result.get()
+
+    @pytest.mark.parametrize('deadline', [
+        # naive datetime is assumed to be UTC
+        datetime(2026, 10, 1, 12, 0, 0),
+        # numeric POSIX timestamp
+        datetime(2026, 10, 1, 12, 0, 0, tzinfo=timezone.utc).timestamp(),
+    ])
+    def test_deadline_formats_at_boundary(self, deadline):
+        task = self._deadline_task(max_retries=3, retry_deadline=deadline)
+        with self._frozen_clock(), \
+                patch.object(task, 'retry', wraps=task.retry) as fake_retry:
+            result = task.apply((1, 0))
+
+        assert task.iterations == 1
+        assert fake_retry.call_count == 0
+        with pytest.raises(RetryDeadlineExceededError):
+            result.get()
+
+    def test_retry_deadline_from_task_attribute(self):
+        class TaskWithDeadline(Task):
+            autoretry_for = (ZeroDivisionError,)
+            max_retries = 3
+            retry_deadline = test_autoretry_deadline.FROZEN_NOW
+
+        @self.app.task(bind=True, base=TaskWithDeadline, shared=False)
+        def deadline_from_base_task(self_, x, y):
+            self_.iterations += 1
+            return x / y
+
+        task = deadline_from_base_task
+        task.iterations = 0
+        with self._frozen_clock(), \
+                patch.object(task, 'retry', wraps=task.retry) as fake_retry:
+            result = task.apply((1, 0))
+
+        assert task.iterations == 1
+        assert fake_retry.call_count == 0
+        with pytest.raises(RetryDeadlineExceededError):
+            result.get()
 
 
 class test_canvas_utils(TasksCase):
