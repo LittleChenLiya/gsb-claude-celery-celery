@@ -64,6 +64,27 @@ revoked_tasks = state.revoked
 revoked_stamps = state.revoked_stamps
 
 
+def _revocation_fence_trace(trace, task_id, *trace_args):
+    """Revocation fence wrapping pool-side task execution.
+
+    A task can be revoked in the window between its request being
+    claimed (handed over to the pool) and the pool actually calling the
+    task.  This wrapper is the first thing the pool executes: it
+    re-checks the revoked set as late as possible before user code runs
+    and refuses to trace a task that was revoked in that window.
+
+    This is a module-level function so that it stays picklable for
+    process-based pools.
+
+    Raises:
+        celery.exceptions.TaskRevokedError: if the task was revoked
+            after the request was claimed by the pool.
+    """
+    if task_id in revoked_tasks:
+        raise TaskRevokedError(task_id)
+    return trace(*trace_args)
+
+
 class Request:
     """A request for task execution."""
 
@@ -361,18 +382,25 @@ class Request:
 
         time_limit, soft_time_limit = self.time_limits
         trace = fast_trace_task if self._app.use_fast_trace_task else trace_task_ret
-        result = pool.apply_async(
-            trace,
-            args=(self._type, task_id, self._request_dict, self._body,
-                  self._content_type, self._content_encoding),
-            accept_callback=self.on_accepted,
-            timeout_callback=self.on_timeout,
-            callback=self.on_success,
-            error_callback=self.on_failure,
-            soft_timeout=soft_time_limit or task.soft_time_limit,
-            timeout=time_limit or task.time_limit,
-            correlation_id=task_id,
-        )
+        try:
+            result = pool.apply_async(
+                _revocation_fence_trace,
+                args=(trace, task_id, self._type, task_id, self._request_dict,
+                      self._body, self._content_type, self._content_encoding),
+                accept_callback=self.on_accepted,
+                timeout_callback=self.on_timeout,
+                callback=self.on_success,
+                error_callback=self.on_failure,
+                soft_timeout=soft_time_limit or task.soft_time_limit,
+                timeout=time_limit or task.time_limit,
+                correlation_id=task_id,
+            )
+        except TaskRevokedError:
+            # The revocation fence tripped synchronously (in-process
+            # pools): announce the revoke exactly once, then propagate
+            # so the caller can release its pool slot.
+            self._announce_revoked_once('revoked')
+            raise
         # cannot create weakref to None
         self._apply_result = maybe(ref, result)
         return result
@@ -390,6 +418,14 @@ class Request:
         # acknowledge task as being processed.
         if not self.task.acks_late:
             self.acknowledge()
+
+        # Revocation fence: the task may have been revoked in the window
+        # between the claim above and the actual execution, so re-check
+        # as late as possible; a revoked task must never reach user code.
+        # If revoked, ``revoked()`` has already announced the revoke and
+        # acknowledged the message (acknowledgement happens exactly once).
+        if self.revoked():
+            return
 
         _, _, embed = self._payload
         request = self._request_dict
@@ -459,6 +495,17 @@ class Request:
 
         if emit_retry:
             send_retry(self.task, request=self._context, einfo=None)
+
+    def _announce_revoked_once(self, reason, terminated=False, signum=None,
+                               expired=False):
+        """Announce the revoke unless it was already announced.
+
+        The revoke of a single request must only be announced (and the
+        message acknowledged) once, no matter how many fences observed
+        the revocation.
+        """
+        if not self._already_revoked:
+            self._announce_revoked(reason, terminated, signum, expired)
 
     def _announce_revoked(self, reason, terminated, signum, expired):
         task_ready(self)
@@ -659,6 +706,13 @@ class Request:
                 # would not have had time to write the result.
                 self._announce_revoked(
                     'terminated', True, str(exc), False)
+            return
+        if isinstance(exc, TaskRevokedError):
+            # The pool-side revocation fence refused to run this task
+            # after the request was claimed but before user code ran.
+            # Announce the revoke (exactly once) instead of recording
+            # a task failure.
+            self._announce_revoked_once('revoked')
             return
         if isinstance(exc, (SystemExit, KeyboardInterrupt)):
             if self._already_cancelled or self._already_revoked:
@@ -884,18 +938,25 @@ def create_request_cls(base, task, pool, hostname, eventer,
                 raise TaskRevokedError(task_id)
 
             time_limit, soft_time_limit = self.time_limits
-            result = apply_async(
-                trace,
-                args=(self.type, task_id, self.request_dict, self.body,
-                      self.content_type, self.content_encoding),
-                accept_callback=self.on_accepted,
-                timeout_callback=self.on_timeout,
-                callback=self.on_success,
-                error_callback=self.on_failure,
-                soft_timeout=soft_time_limit or default_soft_time_limit,
-                timeout=time_limit or default_time_limit,
-                correlation_id=task_id,
-            )
+            try:
+                result = apply_async(
+                    _revocation_fence_trace,
+                    args=(trace, task_id, self.type, task_id, self.request_dict,
+                          self.body, self.content_type, self.content_encoding),
+                    accept_callback=self.on_accepted,
+                    timeout_callback=self.on_timeout,
+                    callback=self.on_success,
+                    error_callback=self.on_failure,
+                    soft_timeout=soft_time_limit or default_soft_time_limit,
+                    timeout=time_limit or default_time_limit,
+                    correlation_id=task_id,
+                )
+            except TaskRevokedError:
+                # The revocation fence tripped synchronously (in-process
+                # pools): announce the revoke exactly once, then
+                # propagate so the caller can release its pool slot.
+                self._announce_revoked_once('revoked')
+                raise
             # cannot create weakref to None
             # pylint: disable=attribute-defined-outside-init
             self._apply_result = maybe(ref, result)

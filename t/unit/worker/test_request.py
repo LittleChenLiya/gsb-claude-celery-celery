@@ -20,7 +20,7 @@ from celery.exceptions import (Ignore, InvalidTaskError, Reject, Retry, TaskRevo
 from celery.signals import task_failure, task_retry, task_revoked
 from celery.worker import request as module
 from celery.worker import strategy
-from celery.worker.request import Request, create_request_cls
+from celery.worker.request import Request, _revocation_fence_trace, create_request_cls
 from celery.worker.request import logger as req_logger
 from celery.worker.state import revoked, revoked_stamps
 
@@ -1716,13 +1716,15 @@ class test_Request(RequestCase):
         p = Mock()
         job.execute_using_pool(p)
         p.apply_async.assert_called_once()
-        trace = p.apply_async.call_args[0][0]
-        assert trace == trace_task_ret
+        fence = p.apply_async.call_args[0][0]
+        assert fence == _revocation_fence_trace
         args = p.apply_async.call_args[1]['args']
-        assert args[0] == self.mytask.name
+        assert args[0] == trace_task_ret
         assert args[1] == tid
-        assert args[2] == job.request_dict
-        assert args[3] == job.message.body
+        assert args[2] == self.mytask.name
+        assert args[3] == tid
+        assert args[4] == job.request_dict
+        assert args[5] == job.message.body
 
     def test_execute_using_pool_fast_trace_task(self):
         self.app.use_fast_trace_task = True
@@ -1731,13 +1733,15 @@ class test_Request(RequestCase):
         p = Mock()
         job.execute_using_pool(p)
         p.apply_async.assert_called_once()
-        trace = p.apply_async.call_args[0][0]
-        assert trace == fast_trace_task
+        fence = p.apply_async.call_args[0][0]
+        assert fence == _revocation_fence_trace
         args = p.apply_async.call_args[1]['args']
-        assert args[0] == self.mytask.name
+        assert args[0] == fast_trace_task
         assert args[1] == tid
-        assert args[2] == job.request_dict
-        assert args[3] == job.message.body
+        assert args[2] == self.mytask.name
+        assert args[3] == tid
+        assert args[4] == job.request_dict
+        assert args[5] == job.message.body
 
     def _test_on_failure(self, exception, **kwargs):
         tid = uuid()
@@ -1902,9 +1906,9 @@ class test_create_request_class(RequestCase):
         job = self.zRequest(id=uuid(), revoked_tasks=set(), ref=weakref_ref)
         job.execute_using_pool(self.pool)
         self.pool.apply_async.assert_called_with(
-            trace_task_ret,
-            args=(job.type, job.id, job.request_dict, job.body,
-                  job.content_type, job.content_encoding),
+            _revocation_fence_trace,
+            args=(trace_task_ret, job.id, job.type, job.id, job.request_dict,
+                  job.body, job.content_type, job.content_encoding),
             accept_callback=job.on_accepted,
             timeout_callback=job.on_timeout,
             callback=job.on_success,
@@ -1923,9 +1927,9 @@ class test_create_request_class(RequestCase):
         job = self.zRequest(id=uuid(), revoked_tasks=set(), ref=weakref_ref)
         job.execute_using_pool(self.pool)
         self.pool.apply_async.assert_called_with(
-            fast_trace_task,
-            args=(job.type, job.id, job.request_dict, job.body,
-                  job.content_type, job.content_encoding),
+            _revocation_fence_trace,
+            args=(fast_trace_task, job.id, job.type, job.id, job.request_dict,
+                  job.body, job.content_type, job.content_encoding),
             accept_callback=job.on_accepted,
             timeout_callback=job.on_timeout,
             callback=job.on_success,
@@ -1946,9 +1950,9 @@ class test_create_request_class(RequestCase):
                             headers={'timelimit': None})
         job.execute_using_pool(self.pool)
         self.pool.apply_async.assert_called_with(
-            trace_task_ret,
-            args=(job.type, job.id, job.request_dict, job.body,
-                  job.content_type, job.content_encoding),
+            _revocation_fence_trace,
+            args=(trace_task_ret, job.id, job.type, job.id, job.request_dict,
+                  job.body, job.content_type, job.content_encoding),
             accept_callback=job.on_accepted,
             timeout_callback=job.on_timeout,
             callback=job.on_success,
