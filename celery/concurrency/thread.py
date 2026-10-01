@@ -33,6 +33,7 @@ class TaskPool(BasePool):
 
     body_can_be_buffer = True
     signal_safe = False
+    supports_execution_fence = True
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -49,10 +50,12 @@ class TaskPool(BasePool):
         kwargs: dict[str, Any] | None = None,
         callback: Callable[..., Any] | None = None,
         accept_callback: Callable[..., Any] | None = None,
+        fence_callback: Callable[[], bool] | None = None,
         **_: Any
     ) -> ApplyResult:
         f = self.executor.submit(apply_target, target, args, kwargs,
-                                 callback, accept_callback)
+                                 callback, accept_callback,
+                                 fence_callback=fence_callback)
         return ApplyResult(f)
 
     def _get_info(self) -> PoolInfo:

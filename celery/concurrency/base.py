@@ -21,11 +21,18 @@ logger = get_logger('celery.pool')
 
 def apply_target(target, args=(), kwargs=None, callback=None,
                  accept_callback=None, pid=None, getpid=os.getpid,
-                 propagate=(), monotonic=time.monotonic, **_):
+                 propagate=(), monotonic=time.monotonic,
+                 fence_callback=None, **_):
     """Apply function within pool context."""
     kwargs = {} if not kwargs else kwargs
     if accept_callback:
         accept_callback(pid or getpid(), monotonic())
+    # Revocation execution fence: re-check revocation immediately before
+    # the user function runs, closing the race where a revoke arrives
+    # between accept_callback and the target.  If the task was revoked
+    # while queued, skip the user function entirely.
+    if fence_callback is not None and not fence_callback():
+        return
     try:
         ret = target(*args, **kwargs)
     except propagate:
@@ -59,6 +66,10 @@ class BasePool:
 
     #: set to true if pool uses greenlets.
     is_green = False
+
+    #: set to true if the pool invokes the revocation execution fence
+    #: callback between accept_callback and the target function.
+    supports_execution_fence = False
 
     _state = None
     _pool = None

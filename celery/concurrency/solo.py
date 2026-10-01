@@ -12,6 +12,7 @@ class TaskPool(BasePool):
     """Solo task pool (blocking, inline, fast)."""
 
     body_can_be_buffer = True
+    supports_execution_fence = True
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

@@ -2,8 +2,9 @@ import numbers
 import os
 import signal
 import socket
+import threading
 from datetime import datetime, timedelta, timezone
-from time import monotonic, time
+from time import monotonic, sleep, time
 from unittest.mock import ANY, Mock, patch
 
 import pytest
@@ -1971,3 +1972,178 @@ class test_create_request_class(RequestCase):
         assert job._apply_result
         weakref_ref.assert_called_with(self.pool.apply_async())
         assert job._apply_result is weakref_ref()
+
+
+class test_execution_fence(RequestCase):
+    """Tests for the revocation execution fence.
+
+    The fence re-checks revocation immediately before the user function
+    executes, closing the race where a revoke arrives between the initial
+    ``revoked()`` check in ``execute_using_pool`` and the task actually
+    starting in the pool worker.
+    """
+
+    def setup_method(self):
+        super().setup_method()
+        # Use a real threads pool so the fence runs in a worker thread
+        # that shares process state with the main thread.
+        from celery.concurrency.thread import TaskPool
+        self.pool = TaskPool(limit=1)
+        self.pool.start()
+        # Build the fast-trace path used by the worker so the task
+        # registry shortcut is populated.
+        setup_worker_optimizations(self.app)
+
+    def teardown_method(self):
+        self.pool.stop()
+
+    def _build_tracers(self):
+        for name, task in self.app.tasks.items():
+            task.__trace__ = build_tracer(
+                name, task, self.app.loader, 'fence-hostname', app=self.app,
+            )
+
+    def _make_request(self, task_name, task_id=None, on_ack=None):
+        task_id = task_id or uuid()
+        message = Mock()
+        message.headers = {'id': task_id, 'task': task_name}
+        message.body = ((), {}, {})
+        message.payload = message.body
+        message.content_type = None
+        message.content_encoding = None
+        message.delivery_info = {}
+        message.properties = {}
+        return Request(
+            message, app=self.app,
+            on_ack=on_ack or Mock(name='on_ack'),
+            on_reject=Mock(name='on_reject'),
+            decoded=True,
+        )
+
+    def test_execution_fence_returns_true_when_not_revoked(self):
+        job = self._make_request(self.mytask.name)
+        assert job.execution_fence() is True
+
+    def test_execution_fence_returns_false_when_revoked(self):
+        job = self._make_request(self.mytask.name)
+        revoked.add(job.id)
+        assert job.execution_fence() is False
+        assert job._already_revoked
+
+    def test_fence_blocks_user_function_when_revoked_between_claim_and_call(self):
+        """Revoke lands after on_accepted (claim) but before the user
+        function (call); the fence must prevent execution and ack exactly
+        once."""
+        user_function_called = threading.Event()
+
+        @self.app.task(shared=False)
+        def fenced_task():
+            user_function_called.set()
+            return 'done'
+
+        self._build_tracers()
+
+        on_ack = Mock(name='on_ack')
+        job = self._make_request(fenced_task.name, on_ack=on_ack)
+
+        worker_at_barrier = threading.Event()
+        barrier = threading.Barrier(2)
+
+        original_on_accepted = job.on_accepted
+        def wrapped_on_accepted(pid, time_accepted):
+            original_on_accepted(pid, time_accepted)
+            worker_at_barrier.set()
+            barrier.wait()
+        job.on_accepted = wrapped_on_accepted
+
+        job.execute_using_pool(self.pool)
+
+        # Wait for the worker to reach the fence (between claim and call).
+        assert worker_at_barrier.wait(timeout=5)
+
+        # Revoke the task while the worker is blocked at the barrier.
+        revoked.add(job.id)
+
+        # Release the worker; the fence must now see the revocation.
+        barrier.wait()
+
+        # Wait for the worker to finish processing.
+        sleep(1)
+
+        assert not user_function_called.is_set(), \
+            'user function must not execute when revoked between claim and call'
+        assert on_ack.call_count == 1, \
+            f'expected exactly 1 ack, got {on_ack.call_count}'
+        assert job.acknowledged
+
+    def test_user_function_runs_when_not_revoked(self):
+        """Without a revoke, the fence passes and the user function runs."""
+        user_function_called = threading.Event()
+
+        @self.app.task(shared=False)
+        def unfenced_task():
+            user_function_called.set()
+            return 'done'
+
+        self._build_tracers()
+
+        on_ack = Mock(name='on_ack')
+        job = self._make_request(unfenced_task.name, on_ack=on_ack)
+        job.execute_using_pool(self.pool)
+
+        sleep(1)
+
+        assert user_function_called.is_set(), \
+            'user function should execute when not revoked'
+        assert on_ack.call_count == 1
+
+    def test_already_started_task_keeps_existing_semantics(self):
+        """Once the fence has passed (task started), a later revoke must
+        not prevent the user function from running."""
+        user_function_called = threading.Event()
+        fence_passed = threading.Event()
+
+        @self.app.task(shared=False)
+        def started_task():
+            user_function_called.set()
+            return 'done'
+
+        self._build_tracers()
+
+        job = self._make_request(started_task.name)
+
+        original_fence = job.execution_fence
+        def wrapped_fence():
+            result = original_fence()
+            fence_passed.set()
+            return result
+        job.execution_fence = wrapped_fence
+
+        job.execute_using_pool(self.pool)
+
+        # Wait for the fence to pass (task is now started).
+        assert fence_passed.wait(timeout=5)
+
+        # Revoke after the fence has passed; the task is already running.
+        revoked.add(job.id)
+
+        sleep(1)
+
+        assert user_function_called.is_set(), \
+            'already-started task must keep existing semantics'
+
+    def test_execute_using_pool_passes_fence_callback_for_supporting_pools(self):
+        job = self._make_request(self.mytask.name)
+        with patch.object(self.pool, 'apply_async') as apply_async:
+            job.execute_using_pool(self.pool)
+            _, kwargs = apply_async.call_args
+            assert kwargs.get('fence_callback') == job.execution_fence
+
+    def test_execute_using_pool_skips_fence_callback_for_unsupported_pools(self):
+        job = self._make_request(self.mytask.name)
+        unsupported_pool = Mock(name='pool')
+        unsupported_pool.supports_execution_fence = False
+        with patch.object(unsupported_pool, 'apply_async') as apply_async:
+            job.execute_using_pool(unsupported_pool)
+            _, kwargs = apply_async.call_args
+            assert 'fence_callback' not in kwargs

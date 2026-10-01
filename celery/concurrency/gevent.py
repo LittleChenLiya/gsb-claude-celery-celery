@@ -90,6 +90,7 @@ class TaskPool(base.BasePool):
     signal_safe = False
     is_green = True
     task_join_will_block = False
+    supports_execution_fence = True
     _pool = None
     _pool_map = None
     _quick_put = None
@@ -115,12 +116,14 @@ class TaskPool(base.BasePool):
 
     def on_apply(self, target, args=None, kwargs=None, callback=None,
                  accept_callback=None, timeout=None,
-                 timeout_callback=None, apply_target=apply_target, **_):
+                 timeout_callback=None, fence_callback=None,
+                 apply_target=apply_target, **_):
         timeout = self.timeout if timeout is None else timeout
         target = self._make_killable_target(target)
         greenlet = self._quick_put(apply_timeout if timeout else apply_target,
                                    target, args, kwargs, callback, accept_callback,
-                                   self.getpid, timeout=timeout, timeout_callback=timeout_callback)
+                                   self.getpid, timeout=timeout, timeout_callback=timeout_callback,
+                                   fence_callback=fence_callback)
         self._add_to_pool_map(id(greenlet), greenlet)
         greenlet.terminate = types.MethodType(_terminate, greenlet)
         return greenlet

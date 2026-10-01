@@ -361,8 +361,7 @@ class Request:
 
         time_limit, soft_time_limit = self.time_limits
         trace = fast_trace_task if self._app.use_fast_trace_task else trace_task_ret
-        result = pool.apply_async(
-            trace,
+        apply_async_kwargs = dict(
             args=(self._type, task_id, self._request_dict, self._body,
                   self._content_type, self._content_encoding),
             accept_callback=self.on_accepted,
@@ -373,9 +372,40 @@ class Request:
             timeout=time_limit or task.time_limit,
             correlation_id=task_id,
         )
+        # Revocation execution fence: re-check revocation immediately before
+        # the user function runs, closing the race where a revoke arrives
+        # between the revoked() check above and the task actually starting
+        # in the pool worker.  Only pools that invoke the fence callback
+        # between accept_callback and the trace target support this.
+        if getattr(pool, 'supports_execution_fence', False):
+            apply_async_kwargs['fence_callback'] = self.execution_fence
+        result = pool.apply_async(trace, **apply_async_kwargs)
         # cannot create weakref to None
         self._apply_result = maybe(ref, result)
         return result
+
+    def execution_fence(self):
+        """Revocation execution fence.
+
+        Re-checks revocation immediately before the user function is
+        about to execute.  This closes the race where a task is revoked
+        after the initial :meth:`revoked` check in
+        :meth:`execute_using_pool` but before the user function actually
+        starts running in the pool worker.
+
+        Tasks that have already started (i.e. the user function has been
+        entered) are not affected by this fence and keep their existing
+        revocation semantics.
+
+        Returns:
+            bool: ``True`` if the task may proceed with execution,
+                ``False`` if it was revoked while queued (in which case
+                the revocation has already been announced and the message
+                acknowledged exactly once).
+        """
+        if self.revoked():
+            return False
+        return True
 
     def execute(self, loglevel=None, logfile=None):
         """Execute the task in a :func:`~celery.app.trace.trace_task`.
