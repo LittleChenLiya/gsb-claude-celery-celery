@@ -52,6 +52,30 @@ class MapRoute:
                 except ValueError:
                     return {'queue': route}
 
+    def explain(self, name):
+        """Explain which rule in this map matches task ``name``.
+
+        Read-only: returns a description of the matching rule without
+        modifying the route map or expanding any destination.
+        """
+        if name in self.map:
+            return {
+                'matched': True,
+                'match_type': 'exact',
+                'key': name,
+                'route': self(name),
+            }
+        for regex, route in self.patterns.items():
+            if regex.match(name):
+                return {
+                    'matched': True,
+                    'match_type': 'pattern',
+                    'key': regex.pattern,
+                    'route': self(name),
+                }
+        return {'matched': False, 'match_type': None, 'key': None,
+                'route': None}
+
 
 class Router:
     """Route tasks based on the :setting:`task_routes` setting."""
@@ -74,6 +98,83 @@ class Router:
             options = lpmerge(self.expand_destination(
                 self.app.conf.task_default_queue), options)
         return options
+
+    def explain(self, options, name, args=(), kwargs=None, task_type=None):
+        """Explain how task ``name`` would be routed, without routing it.
+
+        Read-only entry point: it reports which router and rule matched
+        (and the resulting queue), but never mutates the route tables or
+        the caller's ``options``, and never publishes anything.
+
+        Returns a dict with the keys:
+
+        - ``task``: name of the task explained.
+        - ``matched``: True if a configured route matched.
+        - ``router``/``router_index``: the matching router and its
+          position in :setting:`task_routes` (None when unmatched).
+        - ``rule``: the raw route returned by the matching router.
+        - ``detail``: per-rule explanation from the matching router
+          itself (e.g. :class:`MapRoute` reports the exact key or
+          glob/regex pattern that matched), when available.
+        - ``route``: the final merged route options (same result as
+          :meth:`route` would produce).
+        - ``queue``: name of the final queue (or None).
+        - ``default_source``: when no route matched, where the queue
+          comes from: ``'task_default_queue'`` (the setting, see
+          ``default_value``) or ``'options'`` (queue passed in
+          ``options``).  None when a route matched.
+        """
+        kwargs = {} if not kwargs else kwargs
+        # work on copies so the caller's options and any cached route
+        # dicts are never mutated (expand_destination pops 'queue').
+        options = self.expand_destination(dict(options))
+        explanation = {
+            'task': name,
+            'matched': False,
+            'router': None,
+            'router_index': None,
+            'rule': None,
+            'detail': None,
+            'route': None,
+            'queue': None,
+            'default_source': None,
+            'default_value': None,
+        }
+        route = None
+        if self.routes:
+            # same traversal as lookup_route(): first non-None wins.
+            for index, router in enumerate(self.routes):
+                route = self.query_router(
+                    router, name, args, kwargs, options, task_type)
+                if route is not None:
+                    if route:  # mirrors the truthiness check in route()
+                        evaluated = maybe_evaluate(router)
+                        detail = getattr(evaluated, 'explain', None)
+                        explanation.update(
+                            matched=True,
+                            router=evaluated,
+                            router_index=index,
+                            rule=route,
+                            detail=(detail(name)
+                                    if callable(detail) else None),
+                        )
+                    break
+        if explanation['matched']:
+            if isinstance(route, Mapping):
+                route = dict(route)  # don't mutate cached route
+            # expands 'queue' in route.
+            options = lpmerge(self.expand_destination(route), options)
+        elif 'queue' not in options:
+            default = self.app.conf.task_default_queue
+            explanation['default_source'] = 'task_default_queue'
+            explanation['default_value'] = default
+            options = lpmerge(self.expand_destination(default), options)
+        else:
+            explanation['default_source'] = 'options'
+        explanation['route'] = options
+        queue = options.get('queue')
+        explanation['queue'] = getattr(queue, 'name', queue)
+        return explanation
 
     def expand_destination(self, route):
         # Route can be a queue name: convenient for direct exchanges.

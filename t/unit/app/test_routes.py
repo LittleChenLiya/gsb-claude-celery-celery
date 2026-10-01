@@ -212,6 +212,104 @@ class TestRouter:
             return 'bar'
 
 
+class test_explain(RouteCase):
+
+    def setup_method(self):
+        super().setup_method()
+        set_queues(
+            self.app, foo=self.a_queue, bar=self.b_queue,
+            **{self.app.conf.task_default_queue: self.d_queue})
+        self.R = routes.prepare((
+            {self.mytask.name: {'queue': 'bar'}},      # exact
+            {'proj.tasks.*': {'queue': 'foo'}},        # glob
+        ))
+        self.router = Router(self.app, self.R, self.app.amqp.queues)
+
+    def assert_consistent_with_route(self, router, name, options=None):
+        options = {} if options is None else options
+        explanation = router.explain(dict(options), name)
+        actual = router.route(dict(options), name)
+        assert explanation['route'] == actual
+        queue = actual.get('queue')
+        assert explanation['queue'] == getattr(queue, 'name', queue)
+        return explanation
+
+    def test_explain_exact_match(self):
+        e = self.assert_consistent_with_route(self.router, self.mytask.name)
+        assert e['matched'] is True
+        assert e['router_index'] == 0
+        assert e['rule'] == {'queue': 'bar'}
+        assert e['queue'] == 'bar'
+        assert e['default_source'] is None
+        assert e['detail']['match_type'] == 'exact'
+        assert e['detail']['key'] == self.mytask.name
+
+    def test_explain_glob_match(self):
+        e = self.assert_consistent_with_route(self.router, 'proj.tasks.x')
+        assert e['matched'] is True
+        assert e['router_index'] == 1
+        assert e['rule'] == {'queue': 'foo'}
+        assert e['queue'] == 'foo'
+        assert e['default_source'] is None
+        assert e['detail']['match_type'] == 'pattern'
+        assert e['detail']['key']  # compiled pattern source reported
+
+    def test_explain_default_queue(self):
+        e = self.assert_consistent_with_route(self.router, 'celery.unknown')
+        assert e['matched'] is False
+        assert e['router'] is None
+        assert e['router_index'] is None
+        assert e['rule'] is None
+        assert e['default_source'] == 'task_default_queue'
+        assert e['default_value'] == self.app.conf.task_default_queue
+        assert e['queue'] == self.app.conf.task_default_queue
+
+    def test_explain_default_from_options(self):
+        e = self.assert_consistent_with_route(
+            self.router, 'celery.unknown', {'queue': 'foo'})
+        assert e['matched'] is False
+        assert e['default_source'] == 'options'
+        assert e['queue'] == 'foo'
+
+    def test_explain_is_read_only(self):
+        cached_route = {'queue': 'foo', 'routing_key': 'cached'}
+
+        class CachingRouter:
+            def __init__(self):
+                self.calls = 0
+
+            def __call__(self, name, *args, **kwargs):
+                self.calls += 1
+                return cached_route  # same object every time
+
+        caching = CachingRouter()
+        router = Router(
+            self.app, routes.prepare([caching]), self.app.amqp.queues)
+        options = {'queue': 'bar', 'priority': 3}
+        e = router.explain(options, 'celery.x')
+        # caller's options untouched
+        assert options == {'queue': 'bar', 'priority': 3}
+        # cached route dict not mutated by expand_destination
+        assert cached_route == {'queue': 'foo', 'routing_key': 'cached'}
+        # route tables untouched
+        assert self.R[0].map == {self.mytask.name: {'queue': 'bar'}}
+        assert e['matched'] is True
+        # explicit options override the matched route, exactly like
+        # route() merges them (lpmerge: options win over the route).
+        assert e['queue'] == 'bar'
+        # explanation agrees with an actual routing decision, and
+        # explaining first did not consume/alter it.
+        actual = router.route(dict(options), 'celery.x')
+        assert e['route'] == actual
+
+    def test_explain_maproute_no_match(self):
+        route = routes.MapRoute({'a': {'queue': 'x'}})
+        assert route.explain('b') == {
+            'matched': False, 'match_type': None, 'key': None,
+            'route': None,
+        }
+
+
 class test_prepare:
 
     def test_prepare(self):
