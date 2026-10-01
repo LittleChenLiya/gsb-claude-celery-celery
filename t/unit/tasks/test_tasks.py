@@ -1,6 +1,6 @@
 import socket
 import tempfile
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import ANY, MagicMock, Mock, patch, sentinel
 
 import pytest
@@ -11,7 +11,10 @@ from celery import Task, chain, chord, group, uuid
 from celery.app.task import _reprtask
 from celery.canvas import StampingVisitor, signature
 from celery.contrib.testing.mocks import ContextMock
-from celery.exceptions import CDeprecationWarning, Ignore, ImproperlyConfigured, Retry
+from celery.exceptions import (
+    AutoretryDeadlineExceeded, CDeprecationWarning, Ignore,
+    ImproperlyConfigured, Retry,
+)
 from celery.result import AsyncResult, EagerResult
 from celery.utils.serialization import UnpickleableExceptionWrapper
 
@@ -877,6 +880,174 @@ class test_task_retries(TasksCase):
 
         # First retry should have countdown=1 (first attempt backoff)
         assert fake_retry_b.call_args_list[0][1]['countdown'] == 1
+
+
+class test_autoretry_deadline(TasksCase):
+    """Auto-retry deadline with a frozen clock and in-memory eager tasks."""
+
+    BASE = datetime(2026, 10, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+    def _make_task(self, name, max_retries, deadline, iterations,
+                   exc=ValueError):
+        @self.app.task(name=name, bind=True, shared=False,
+                       autoretry_for=(exc,), max_retries=max_retries,
+                       retry_deadline=deadline)
+        def task(self_, *args, **kwargs):
+            iterations[0] += 1
+            raise exc('boom')
+        return task
+
+    def test_before_deadline_retries_continue(self):
+        # Clock frozen one second before the deadline: retries are not
+        # terminated by the deadline and run until max_retries is reached.
+        iterations = [0]
+        task = self._make_task(
+            'deadline_before', 3, self.BASE, iterations)
+        with patch('celery.app.autoretry._now',
+                   return_value=self.BASE - timedelta(seconds=1)):
+            result = task.apply()
+            with pytest.raises(ValueError):
+                result.get()
+        assert iterations[0] == 4  # 1 initial attempt + 3 retries
+
+    def test_at_deadline_no_extra_retry(self):
+        # Clock frozen exactly at the deadline: the boundary is '>=' so no
+        # extra retry is queued and the task is terminated immediately.
+        iterations = [0]
+        task = self._make_task(
+            'deadline_at', 3, self.BASE, iterations)
+        with patch('celery.app.autoretry._now', return_value=self.BASE):
+            result = task.apply()
+            with pytest.raises(AutoretryDeadlineExceeded) as exc_info:
+                result.get()
+        assert iterations[0] == 1
+        assert exc_info.value.deadline == self.BASE
+        assert exc_info.value.task_args == ()
+        assert exc_info.value.task_kwargs == {}
+        assert isinstance(exc_info.value.__cause__, ValueError)
+
+    def test_after_deadline_terminates(self):
+        iterations = [0]
+        task = self._make_task(
+            'deadline_after', 3, self.BASE, iterations)
+        with patch('celery.app.autoretry._now',
+                   return_value=self.BASE + timedelta(seconds=1)):
+            result = task.apply()
+            with pytest.raises(AutoretryDeadlineExceeded):
+                result.get()
+        assert iterations[0] == 1
+
+    def test_max_retries_first(self):
+        # Deadline is far in the future: max_retries is exhausted first and
+        # the original failure is reported (existing behavior preserved).
+        iterations = [0]
+        task = self._make_task(
+            'deadline_max_first', 2, self.BASE + timedelta(hours=1),
+            iterations)
+        with patch('celery.app.autoretry._now', return_value=self.BASE):
+            result = task.apply()
+            with pytest.raises(ValueError):
+                result.get()
+        assert iterations[0] == 3
+
+    def test_deadline_first(self):
+        # max_retries is not reached but the deadline has passed: the task
+        # is terminated with a clear reason instead of being requeued.
+        iterations = [0]
+        task = self._make_task(
+            'deadline_deadline_first', 5, self.BASE - timedelta(seconds=1),
+            iterations)
+        with patch('celery.app.autoretry._now', return_value=self.BASE):
+            result = task.apply()
+            with pytest.raises(AutoretryDeadlineExceeded):
+                result.get()
+        assert iterations[0] == 1
+
+    def test_max_retries_priority_at_boundary(self):
+        # Advancing clock: on the attempt where max_retries is exhausted the
+        # clock also hits the deadline. max_retries keeps its priority, so
+        # the original failure is reported, not the deadline error.
+        iterations = [0]
+        task = self._make_task(
+            'deadline_priority', 2, self.BASE + timedelta(seconds=2),
+            iterations)
+        times = [self.BASE + timedelta(seconds=i) for i in range(3)]
+        with patch('celery.app.autoretry._now', side_effect=times):
+            result = task.apply()
+            with pytest.raises(ValueError):
+                result.get()
+        assert iterations[0] == 3
+
+    def test_no_deadline_unchanged_behavior(self):
+        # Without a deadline the auto-retry behavior is unchanged.
+        iterations = [0]
+        task = self._make_task('deadline_none', 2, None, iterations)
+        with patch('celery.app.autoretry._now', return_value=self.BASE):
+            result = task.apply()
+            with pytest.raises(ValueError):
+                result.get()
+        assert iterations[0] == 3
+
+    def test_callable_deadline(self):
+        # A callable returning an absolute datetime is also accepted.
+        iterations = [0]
+        task = self._make_task(
+            'deadline_callable', 5, lambda: self.BASE, iterations)
+        with patch('celery.app.autoretry._now', return_value=self.BASE):
+            result = task.apply()
+            with pytest.raises(AutoretryDeadlineExceeded):
+                result.get()
+        assert iterations[0] == 1
+
+    def test_naive_deadline(self):
+        # Naive deadlines are compared against naive UTC now.
+        iterations = [0]
+        naive_deadline = datetime(2026, 10, 1, 12, 0, 0)
+        task = self._make_task(
+            'deadline_naive', 5, naive_deadline, iterations)
+        with patch('celery.app.autoretry._now', return_value=self.BASE):
+            result = task.apply()
+            with pytest.raises(AutoretryDeadlineExceeded) as exc_info:
+                result.get()
+        assert iterations[0] == 1
+        assert exc_info.value.deadline == naive_deadline
+
+    def test_deadline_from_task_attribute(self):
+        # retry_deadline can also be set as a task class attribute.
+        class AttributeDeadlineTask(Task):
+            autoretry_for = (ValueError,)
+            retry_deadline = self.BASE
+            max_retries = 5
+
+            def run(self, *args, **kwargs):
+                raise ValueError('boom')
+
+        task = self.app.register_task(AttributeDeadlineTask())
+        with patch('celery.app.autoretry._now', return_value=self.BASE):
+            result = task.apply()
+            with pytest.raises(AutoretryDeadlineExceeded):
+                result.get()
+
+    def test_deadline_error_carries_task_args(self):
+        # The termination reason carries the task arguments, mirroring
+        # MaxRetriesExceededError.
+        iterations = [0]
+        task = self._make_task(
+            'deadline_args', 5, self.BASE, iterations)
+        with patch('celery.app.autoretry._now', return_value=self.BASE):
+            result = task.apply((1, 2), {'kw': 3})
+            with pytest.raises(AutoretryDeadlineExceeded) as exc_info:
+                result.get()
+        assert exc_info.value.task_args == (1, 2)
+        assert exc_info.value.task_kwargs == {'kw': 3}
+
+    def test_deadline_error_is_task_error(self):
+        # The termination reason is a TaskError exposed both on the module
+        # and on the task class, mirroring MaxRetriesExceededError.
+        from celery.exceptions import TaskError
+        from celery.app.task import Task as TaskClass
+        assert issubclass(AutoretryDeadlineExceeded, TaskError)
+        assert TaskClass.AutoretryDeadlineExceeded is AutoretryDeadlineExceeded
 
 
 class test_canvas_utils(TasksCase):

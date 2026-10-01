@@ -10,7 +10,10 @@ from kombu.utils.uuid import uuid
 from celery import current_app, states
 from celery._state import _task_stack
 from celery.canvas import _chain, group, signature
-from celery.exceptions import Ignore, ImproperlyConfigured, MaxRetriesExceededError, Reject, Retry
+from celery.exceptions import (
+    AutoretryDeadlineExceeded, Ignore, ImproperlyConfigured,
+    MaxRetriesExceededError, Reject, Retry,
+)
 from celery.local import class_property
 from celery.result import EagerResult, denied_join_result
 from celery.utils import abstract, deprecated
@@ -216,6 +219,7 @@ class Task:
     __v2_compat__ = False  # set by old base in celery.task.base
 
     MaxRetriesExceededError = MaxRetriesExceededError
+    AutoretryDeadlineExceeded = AutoretryDeadlineExceeded
     OperationalError = OperationalError
 
     #: Execution strategy used, or the qualified name of one.
@@ -239,6 +243,11 @@ class Task:
     #: Maximum number of retries before giving up.  If set to :const:`None`,
     #: it will **never** stop retrying.
     max_retries = 3
+
+    #: Absolute deadline after which auto-retries are terminated instead
+    #: of being queued.  If set to :const:`None`, auto-retries are only
+    #: limited by :attr:`max_retries`.
+    retry_deadline = None
 
     #: Default time in seconds before a retry of the task should be
     #: executed.  3 minutes by default.

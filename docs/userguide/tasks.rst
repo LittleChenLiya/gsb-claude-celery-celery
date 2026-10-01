@@ -752,7 +752,7 @@ via options documented below.
 
 .. versionadded:: 4.4
 
-You can also set `autoretry_for`, `max_retries`, `retry_backoff`, `retry_backoff_max` and `retry_jitter` options in class-based tasks:
+You can also set `autoretry_for`, `max_retries`, `retry_backoff`, `retry_backoff_max`, `retry_jitter` and `retry_deadline` options in class-based tasks:
 
 .. code-block:: python
 
@@ -762,6 +762,7 @@ You can also set `autoretry_for`, `max_retries`, `retry_backoff`, `retry_backoff
         retry_backoff = True
         retry_backoff_max = 700
         retry_jitter = False
+        retry_deadline = None
 
 .. attribute:: Task.autoretry_for
 
@@ -802,6 +803,41 @@ You can also set `autoretry_for`, `max_retries`, `retry_backoff`, `retry_backoff
     value calculated by :attr:`~Task.retry_backoff` is treated as a maximum,
     and the actual delay value will be a random number between zero and that
     maximum. By default, this option is set to ``True``.
+
+.. versionadded:: 5.7.0
+
+.. attribute:: Task.retry_deadline
+
+    An optional absolute deadline after which auto-retries are terminated
+    instead of being queued. The value is an absolute
+    :class:`~datetime.datetime` (or a callable returning one) in UTC. Each
+    time a task with :attr:`~Task.autoretry_for` set fails, the current time
+    is compared against the deadline; once the deadline is reached (the
+    comparison uses ``>=`` so no extra retry is queued at the exact
+    boundary), the task is terminated with
+    :class:`~celery.exceptions.AutoretryDeadlineExceeded` reporting the
+    deadline and the original failure, instead of being retried again.
+
+    This is useful when a task should keep retrying for a bounded amount of
+    wall-clock time rather than a fixed number of attempts. The
+    :attr:`~Task.max_retries` limit keeps its priority: if the maximum number
+    of retries is exhausted before the deadline (or at the same time), the
+    original failure is reported just as without a deadline.
+
+    By default, this option is set to :const:`None`, meaning auto-retries are
+    only limited by :attr:`~Task.max_retries`.
+
+    .. code-block:: python
+
+        from datetime import datetime, timedelta, timezone
+
+        @app.task(
+            autoretry_for=(Exception,),
+            retry_backoff=True,
+            retry_deadline=lambda: datetime.now(timezone.utc) + timedelta(minutes=5),
+        )
+        def fetch():
+            ...
 
 .. versionadded:: 5.3.0
 

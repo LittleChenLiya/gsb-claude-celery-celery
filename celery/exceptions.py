@@ -18,6 +18,7 @@ Error Hierarchy
             - :exc:`~celery.exceptions.AlreadyRegistered`
             - :exc:`~celery.exceptions.TimeoutError`
             - :exc:`~celery.exceptions.MaxRetriesExceededError`
+            - :exc:`~celery.exceptions.AutoretryDeadlineExceeded`
             - :exc:`~celery.exceptions.TaskRevokedError`
             - :exc:`~celery.exceptions.InvalidTaskError`
             - :exc:`~celery.exceptions.ChordError`
@@ -79,7 +80,8 @@ __all__ = (
     # Task related errors.
     'TaskError', 'QueueNotFound', 'IncompleteStream',
     'NotRegistered', 'AlreadyRegistered', 'TimeoutError',
-    'MaxRetriesExceededError', 'TaskRevokedError',
+    'MaxRetriesExceededError', 'AutoretryDeadlineExceeded',
+    'TaskRevokedError',
     'InvalidTaskError', 'ChordError',
 
     # Backend related errors.
@@ -249,6 +251,21 @@ class MaxRetriesExceededError(TaskError):
     """The tasks max restart limit has been exceeded."""
 
     def __init__(self, *args, **kwargs):
+        self.task_args = kwargs.pop("task_args", [])
+        self.task_kwargs = kwargs.pop("task_kwargs", dict())
+        super().__init__(*args, **kwargs)
+
+
+class AutoretryDeadlineExceeded(TaskError):
+    """The tasks auto-retry deadline has been exceeded.
+
+    Raised when a task with :attr:`~celery.Task.retry_deadline` set keeps
+    failing past the configured absolute deadline.  The task is terminated
+    instead of being queued for another retry.
+    """
+
+    def __init__(self, *args, **kwargs):
+        self.deadline = kwargs.pop("deadline", None)
         self.task_args = kwargs.pop("task_args", [])
         self.task_kwargs = kwargs.pop("task_kwargs", dict())
         super().__init__(*args, **kwargs)
