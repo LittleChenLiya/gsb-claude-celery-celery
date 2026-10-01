@@ -54,8 +54,9 @@ Misc
 
 __all__ = (
     'PENDING', 'RECEIVED', 'STARTED', 'SUCCESS', 'FAILURE',
-    'REVOKED', 'RETRY', 'IGNORED', 'READY_STATES', 'UNREADY_STATES',
-    'EXCEPTION_STATES', 'PROPAGATE_STATES', 'precedence', 'state',
+    'REVOKED', 'RETRY', 'IGNORED', 'EXPIRED',
+    'READY_STATES', 'UNREADY_STATES', 'EXCEPTION_STATES',
+    'PROPAGATE_STATES', 'EXPIRED_STATES', 'precedence', 'state',
 )
 
 #: State precedence.
@@ -71,6 +72,7 @@ PRECEDENCE = [
     'REJECTED',
     'RETRY',
     'PENDING',
+    'EXPIRED',
 ]
 
 #: Hash lookup of PRECEDENCE to index
@@ -140,12 +142,22 @@ REJECTED = 'REJECTED'
 #: Task is waiting for retry.
 RETRY = 'RETRY'
 IGNORED = 'IGNORED'
+#: A result for the task once existed in the backend but has since expired
+#: and been cleaned up.  This is distinct from :data:`PENDING`, which means
+#: no result has ever been written for the task id.  It is not part of
+#: :data:`READY_STATES` or :data:`UNREADY_STATES`: expired results can no
+#: longer be retrieved, just like results that were never stored.
+EXPIRED = 'EXPIRED'
 
 READY_STATES = frozenset({SUCCESS, FAILURE, REVOKED})
 UNREADY_STATES = frozenset({PENDING, RECEIVED, STARTED, REJECTED, RETRY})
 EXCEPTION_STATES = frozenset({RETRY, FAILURE, REVOKED})
 PROPAGATE_STATES = frozenset({FAILURE, REVOKED})
 
+#: Set containing only :data:`EXPIRED`, kept symmetric with the other state
+#: sets so callers can test membership without hard-coding the state.
+EXPIRED_STATES = frozenset({EXPIRED})
+
 ALL_STATES = frozenset({
-    PENDING, RECEIVED, STARTED, SUCCESS, FAILURE, RETRY, REVOKED,
+    PENDING, RECEIVED, STARTED, SUCCESS, FAILURE, RETRY, REVOKED, EXPIRED,
 })

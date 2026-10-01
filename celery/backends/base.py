@@ -9,7 +9,7 @@ import sys
 import time
 import warnings
 from collections import deque, namedtuple
-from datetime import timedelta
+from datetime import datetime, timedelta
 from functools import partial
 from uuid import UUID
 from weakref import WeakValueDictionary
@@ -684,11 +684,74 @@ class Backend:
     def is_cached(self, task_id):
         return task_id in self._cache
 
+    def _now(self):
+        """Return the current time.
+
+        Defaults to :meth:`celery.Celery.now`, but can be overridden on an
+        instance (e.g. ``backend._now = lambda: fixed_time``) to exercise
+        expiry handling with a controllable clock without sleeping.
+        """
+        return self.app.now()
+
+    def _result_ttl(self, state):
+        """Return the time-to-live (seconds) for a result in ``state``.
+
+        Only results in a ready state can expire: pending/intermediate
+        states carry no ``date_done`` and may simply be a task that has not
+        finished yet.  Returns :const:`None` when the result must not be
+        considered expired.
+        """
+        if state in self.READY_STATES and self.expires:
+            return self.expires
+        return None
+
+    def _result_expires_at(self, state, date_done):
+        """Return the time at which a ready result expires, or :const:`None`.
+
+        ``date_done`` may be an ISO-8601 string or a timezone-aware
+        :class:`~datetime.datetime`, matching what
+        :meth:`_get_result_meta` produces.
+        """
+        ttl = self._result_ttl(state)
+        if ttl is None or not date_done:
+            return None
+        if isinstance(date_done, str):
+            try:
+                date_done = datetime.fromisoformat(date_done)
+            except ValueError:
+                return None
+        ttl = float(ttl)
+        try:
+            return date_done + timedelta(seconds=ttl)
+        except (TypeError, ArithmeticError):
+            return None
+
+    def _is_result_meta_expired(self, meta, now=None):
+        """Check whether decoded task ``meta`` describes an expired result.
+
+        Results that are not in a ready state never count as expired, even
+        when a ``date_done`` happens to be present: a result that still
+        exists in the backend must never be mistaken for an expired one.
+        """
+        if not isinstance(meta, dict):
+            return False
+        expires_at = self._result_expires_at(
+            meta.get('status'), meta.get('date_done'))
+        if expires_at is None:
+            return False
+        if now is None:
+            now = self._now()
+        if now.tzinfo is None and expires_at.tzinfo is not None:
+            now = now.replace(tzinfo=expires_at.tzinfo)
+        elif expires_at.tzinfo is None and now.tzinfo is not None:
+            expires_at = expires_at.replace(tzinfo=now.tzinfo)
+        return now > expires_at
+
     def _get_result_meta(self, result,
                          state, traceback, request, format_date=True,
                          encode=False):
         if state in self.READY_STATES:
-            date_done = self.app.now()
+            date_done = self._now()
             if format_date:
                 date_done = date_done.isoformat()
         else:
@@ -805,9 +868,18 @@ class Backend:
     def _forget(self, task_id):
         raise NotImplementedError('backend does not implement forget.')
 
-    def get_state(self, task_id):
-        """Get the state of a task."""
-        return self.get_task_meta(task_id)['status']
+    def get_state(self, task_id, distinguish_expired=False):
+        """Get the state of a task.
+
+        By default an expired-and-removed result is reported as
+        :const:`~celery.states.PENDING`, exactly as it always has been.
+        Pass ``distinguish_expired=True`` to get
+        :const:`~celery.states.EXPIRED` instead when the task once had a
+        result that has since expired, while tasks whose id was never seen
+        still come back as :const:`~celery.states.PENDING`.
+        """
+        return self.get_task_meta(
+            task_id, distinguish_expired=distinguish_expired)['status']
 
     get_status = get_state  # XXX compat
 
@@ -849,11 +921,17 @@ class Backend:
         """Hook called before retrying a recoverable backend exception."""
         return None
 
-    def get_task_meta(self, task_id, cache=True):
+    def get_task_meta(self, task_id, cache=True, distinguish_expired=False):
         """Get task meta from backend.
 
         if always_retry_backend_operation is activated, in the event of a recoverable exception,
         then retry operation with an exponential backoff until a limit has been reached.
+
+        With ``distinguish_expired=False`` (the default, backwards-compatible
+        behaviour), a result that expired and was removed is reported as
+        :const:`~celery.states.PENDING`.  With ``distinguish_expired=True``
+        it is reported as :const:`~celery.states.EXPIRED` instead; a task
+        id that never had a result is still :const:`~celery.states.PENDING`.
         """
         self._ensure_not_eager()
         if cache:
@@ -869,9 +947,51 @@ class Backend:
             task_id=task_id
         )
 
+        if distinguish_expired:
+            meta = self._meta_with_expired_state(task_id, meta)
+
         if cache and meta.get('status') == states.SUCCESS:
             self._cache[task_id] = meta
         return meta
+
+    def _meta_with_expired_state(self, task_id, meta):
+        """Map a raw meta dict to its expired-aware form.
+
+        A still-existing result is returned untouched, so it can never be
+        mistaken for an expired one.  Only missing results consult
+        :meth:`_get_expired_status`, which is where backends record that a
+        result used to exist but was cleaned up after expiring.
+        """
+        if meta.get('status') != states.PENDING or meta.get('result') is not None:
+            return meta
+        expired_status = self._get_expired_status(task_id)
+        if expired_status:
+            return {'status': states.EXPIRED, 'result': None}
+        return meta
+
+    def _get_expired_status(self, task_id):
+        """Return :const:`~celery.states.EXPIRED` for an expired task id.
+
+        The default implementation has no way to tell a removed expired
+        result apart from an id that was never written, so it returns
+        :const:`None`.  Backends that keep an expiry marker for removed
+        results override this.
+        """
+        return None
+
+    def is_result_expired(self, task_id):
+        """Check whether a task's result has expired and been cleaned up.
+
+        .. versionadded:: 5.7.0
+
+        Returns:
+            bool: :const:`True` if the task once had a result that has since
+                expired; :const:`False` both when the result still exists
+                and when no result was ever stored for the id.
+        """
+        return self.get_task_meta(
+            task_id, cache=False, distinguish_expired=True
+        )['status'] == states.EXPIRED
 
     def reload_task_result(self, task_id):
         """Reload task result, even if it has been previously fetched."""
@@ -1097,6 +1217,10 @@ class BaseKeyValueStoreBackend(Backend):
     task_keyprefix = 'celery-task-meta-'
     group_keyprefix = 'celery-taskset-meta-'
     chord_keyprefix = 'chord-unlock-'
+    #: Prefix of the expiry marker left behind when a task result expires and
+    #: is removed.  The marker lets later reads distinguish "the result used
+    #: to exist but expired" from "nothing was ever stored for this id".
+    expired_keyprefix = 'celery-task-expired-'
     implements_incr = False
 
     def __init__(self, *args, **kwargs):
@@ -1122,11 +1246,13 @@ class BaseKeyValueStoreBackend(Backend):
             self.task_keyprefix = f"{global_keyprefix}{self.task_keyprefix}"
             self.group_keyprefix = f"{global_keyprefix}{self.group_keyprefix}"
             self.chord_keyprefix = f"{global_keyprefix}{self.chord_keyprefix}"
+            self.expired_keyprefix = f"{global_keyprefix}{self.expired_keyprefix}"
 
     def _encode_prefixes(self):
         self.task_keyprefix = self.key_t(self.task_keyprefix)
         self.group_keyprefix = self.key_t(self.group_keyprefix)
         self.chord_keyprefix = self.key_t(self.chord_keyprefix)
+        self.expired_keyprefix = self.key_t(self.expired_keyprefix)
 
     def get(self, key):
         raise NotImplementedError('Must implement the get method.')
@@ -1166,6 +1292,28 @@ class BaseKeyValueStoreBackend(Backend):
         if not group_id:
             raise ValueError(f'group_id must not be empty. Got {group_id} instead.')
         return self._get_key_for(self.chord_keyprefix, group_id, key)
+
+    def get_key_for_expired_task(self, task_id):
+        """Get the expiry-marker key for a task whose result was removed."""
+        if not task_id:
+            raise ValueError(f'task_id must not be empty. Got {task_id} instead.')
+        return self._get_key_for(self.expired_keyprefix, task_id)
+
+    def _expired_marker(self):
+        """Return the payload stored under an expiry marker key."""
+        return self.encode({'status': states.EXPIRED, 'result': None})
+
+    def _mark_result_expired(self, task_id):
+        """Remove the result for ``task_id`` and leave an expiry marker.
+
+        The marker uses the same expiry as a normal result, so stores with
+        native TTL support (Redis, ...) eventually evict it too; stores
+        without one keep it until it is explicitly removed.
+        """
+        self.delete(self.get_key_for_task(task_id))
+        self._set_with_state(
+            self.get_key_for_expired_task(task_id),
+            self._expired_marker(), states.EXPIRED)
 
     def _get_key_for(self, prefix, id, key=''):
         key_t = self.key_t
@@ -1257,6 +1405,7 @@ class BaseKeyValueStoreBackend(Backend):
 
     def _forget(self, task_id):
         self.delete(self.get_key_for_task(task_id))
+        self.delete(self.get_key_for_expired_task(task_id))
 
     def _store_result(self, task_id, result, state,
                       traceback=None, request=None, **kwargs):
@@ -1274,6 +1423,11 @@ class BaseKeyValueStoreBackend(Backend):
 
         if current_meta['status'] == states.SUCCESS:
             return result
+
+        # A freshly written result must shadow, and clear, any expiry marker
+        # left over from a previous run, so existing results can never read
+        # back as EXPIRED.
+        self.delete(self.get_key_for_expired_task(task_id))
 
         try:
             self._set_with_state(self.get_key_for_task(task_id), self.encode(meta), state)
@@ -1296,6 +1450,34 @@ class BaseKeyValueStoreBackend(Backend):
         if not meta:
             return {'status': states.PENDING, 'result': None}
         return self.decode_result(meta)
+
+    def _get_expired_status(self, task_id):
+        # An expiry marker proves a result used to exist and was removed.
+        if self.get(self.get_key_for_expired_task(task_id)):
+            return states.EXPIRED
+        return None
+
+    def _meta_with_expired_state(self, task_id, meta):
+        # Backends that expire keys themselves (Redis TTL, ...) lose both the
+        # payload and any marker at the same time, so expiry can only be
+        # detected lazily on backends that rely on the periodic cleanup.
+        if self.supports_autoexpire:
+            return super()._meta_with_expired_state(task_id, meta)
+
+        now = self._now()
+        if self._is_result_meta_expired(meta, now=now):
+            # The payload still exists, but it is past its time-to-live:
+            # remove it and leave an expiry marker, so later reads report
+            # EXPIRED instead of pretending the stale result is current.
+            self._mark_result_expired(task_id)
+            return {'status': states.EXPIRED, 'result': None}
+
+        if meta.get('status') != states.PENDING or meta.get('result') is not None:
+            # A result that still exists and is not past its TTL must never
+            # be mistaken for an expired one.
+            return meta
+
+        return super()._meta_with_expired_state(task_id, meta)
 
     def task_result_exists(self, task_id):
         """Check if a result exists in the backend for the given task ID.

@@ -140,6 +140,45 @@ class CacheBackend(KeyValueStoreBackend):
     def expire(self, key, value):
         return self.client.touch(key, value)
 
+    def cleanup(self):
+        """Expire task results kept in the in-memory store.
+
+        Real memcached servers evict keys by TTL on their own and cannot be
+        enumerated, so this only acts on the in-memory client.  Expired
+        results are replaced by an expiry marker (see
+        :meth:`BaseKeyValueStoreBackend._mark_result_expired`), which keeps
+        "used to exist but expired" distinguishable from "never stored".
+        """
+        if self.backend != 'memory':
+            return
+        self._ensure_retryable(self._cleanup_memory)
+
+    def _cleanup_memory(self):
+        if not self.expires:
+            return
+        task_prefix = self.task_keyprefix
+        now = self._now()
+        cache = self.client.cache
+        for key in list(cache):
+            # the in-memory client keeps bytes keys; compare against the
+            # same type so this works regardless of key_t
+            key_prefix = task_prefix
+            if isinstance(key, (bytes, bytearray)) and not isinstance(key_prefix, (bytes, bytearray)):
+                key_prefix = ensure_bytes(key_prefix)
+            elif not isinstance(key, (bytes, bytearray)) and isinstance(key_prefix, (bytes, bytearray)):
+                key_prefix = bytes_to_str(key_prefix)
+            if not key.startswith(key_prefix):
+                continue
+            payload = cache.get(key)
+            if not payload:
+                continue
+            try:
+                meta = self.decode_result(payload)
+            except Exception:  # pragma: no cover - defensive
+                continue
+            if self._is_result_meta_expired(meta, now=now):
+                self._mark_result_expired(self._strip_prefix(key))
+
     @cached_property
     def client(self):
         return self.Client(self.servers, **self.options)

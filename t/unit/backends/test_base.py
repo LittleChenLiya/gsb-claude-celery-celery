@@ -1291,6 +1291,95 @@ class test_KeyValueStoreBackend:
         self.b.forget(tid)
         assert self.b.get_state(tid) == states.PENDING
 
+    def test_distinguish_expired_unknown_task_is_pending(self):
+        # An id that was never written stays PENDING even when callers ask
+        # expired and never-existed to be distinguished.
+        tid = uuid()
+        assert self.b.get_state(
+            tid, distinguish_expired=True) == states.PENDING
+        assert self.b.is_result_expired(tid) is False
+
+    def test_existing_result_never_reported_expired(self):
+        from datetime import timedelta
+        b = KVBackend(app=self.app, expires=10)
+        tid = uuid()
+        b.mark_as_done(tid, 42)
+        # move the clock past the TTL: the payload still exists, so it must
+        # be returned as SUCCESS on the old API...
+        b._now = lambda: self.app.now() + timedelta(seconds=11)
+        assert b.get_state(tid) == states.SUCCESS
+        assert b.get_result(tid) == 42
+        # ...and on the new API a non-autoexpire backend lazily expires it
+        # instead of serving a stale value, while a fresh id stays PENDING
+        assert b.get_state(tid, distinguish_expired=True) == states.EXPIRED
+        assert b.is_result_expired(tid) is True
+        other = uuid()
+        b.store_result(other, None, states.STARTED)
+        assert b.get_state(
+            other, distinguish_expired=True) == states.STARTED
+
+    def test_mark_result_expired_and_old_api_compat(self):
+        b = KVBackend(app=self.app, expires=10)
+        tid = uuid()
+        b.mark_as_done(tid, 42)
+        b._mark_result_expired(tid)
+        # old interface: an expired result looks just like PENDING
+        assert b.get_state(tid) == states.PENDING
+        assert b.get_task_meta(tid) == {'status': states.PENDING,
+                                        'result': None}
+        assert b.get_result(tid) is None
+        # new interface: explicit EXPIRED, distinct from never-seen
+        assert b.get_state(
+            tid, distinguish_expired=True) == states.EXPIRED
+        assert b.is_result_expired(tid) is True
+        never = uuid()
+        assert b.get_state(
+            never, distinguish_expired=True) == states.PENDING
+
+    def test_forget_removes_expiry_marker(self):
+        b = KVBackend(app=self.app, expires=10)
+        tid = uuid()
+        b.mark_as_done(tid, 42)
+        b._mark_result_expired(tid)
+        assert b.is_result_expired(tid) is True
+        b.forget(tid)
+        assert b.get_state(
+            tid, distinguish_expired=True) == states.PENDING
+        assert b.is_result_expired(tid) is False
+
+    def test_store_result_clears_stale_expiry_marker(self):
+        b = KVBackend(app=self.app, expires=10)
+        tid = uuid()
+        b.mark_as_done(tid, 1)
+        b._mark_result_expired(tid)
+        # a new result for the same id must never read back as expired
+        b.mark_as_done(tid, 2)
+        assert b.get_state(
+            tid, distinguish_expired=True) == states.SUCCESS
+        assert b.get_result(tid) == 2
+        assert b.is_result_expired(tid) is False
+
+    def test_autoexpire_backend_only_uses_markers(self):
+        # Backends with native TTL eviction cannot detect expiry lazily;
+        # markers left by explicit cleanup still surface, missing keys do not.
+        b = KVBackend(app=self.app, expires=10)
+        b.supports_autoexpire = True
+        tid, never = uuid(), uuid()
+        b.mark_as_done(tid, 1)
+        b._mark_result_expired(tid)
+        assert b.get_state(
+            tid, distinguish_expired=True) == states.EXPIRED
+        assert b.get_state(
+            never, distinguish_expired=True) == states.PENDING
+
+    def test_get_status_accepts_distinguish_expired(self):
+        b = KVBackend(app=self.app, expires=10)
+        tid = uuid()
+        b.mark_as_done(tid, 1)
+        b._mark_result_expired(tid)
+        assert b.get_status(
+            tid, distinguish_expired=True) == states.EXPIRED
+
     @pytest.mark.parametrize('serializer',
                              ['json', 'pickle', 'yaml', 'msgpack'])
     def test_store_result_parent_id(self, serializer):

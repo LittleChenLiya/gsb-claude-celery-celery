@@ -9,6 +9,7 @@ from kombu.utils.encoding import ensure_bytes, str_to_bytes
 from celery import signature, states, uuid
 from celery.backends.cache import CacheBackend, DummyClient, backends
 from celery.exceptions import ImproperlyConfigured
+from kombu.utils.functional import LRUCache
 from t.unit import conftest
 
 
@@ -120,6 +121,51 @@ class test_CacheBackend:
 
     def test_process_cleanup(self):
         self.tb.process_cleanup()
+
+    def test_cleanup_marks_expired_results_with_controllable_clock(self):
+        from datetime import timedelta
+        tb = CacheBackend(backend='memory://', expires=10, app=self.app)
+        tb.client.cache = LRUCache(limit=100)
+        fresh, stale, later, never = uuid(), uuid(), uuid(), uuid()
+        start = tb.app.now()
+        tb._now = lambda: start
+        tb.mark_as_done(fresh, 1)
+        tb.mark_as_done(stale, 2)
+
+        tb.cleanup()
+        # nothing is past the TTL yet, so no result must be touched
+        assert tb.get_state(stale) == states.SUCCESS
+
+        tb._now = lambda: start + timedelta(seconds=11)
+        # a result written at the new clock time is still within its TTL
+        tb.mark_as_done(later, 3)
+        tb.cleanup()
+        # stale result became an expiry marker, fresh ones stayed
+        assert tb.get_state(
+            stale, distinguish_expired=True) == states.EXPIRED
+        assert tb.is_result_expired(stale) is True
+        # old API stays compatible: expired looks PENDING
+        assert tb.get_state(stale) == states.PENDING
+        assert tb.get_result(stale) is None
+        assert tb.get_state(fresh, distinguish_expired=True) == states.EXPIRED
+        assert tb.get_state(later) == states.SUCCESS
+        assert tb.get_result(later) == 3
+        # an id never written is PENDING, never EXPIRED
+        assert tb.get_state(
+            never, distinguish_expired=True) == states.PENDING
+
+    def test_cleanup_noop_without_expires(self):
+        tb = CacheBackend(backend='memory://', expires=None, app=self.app)
+        tid = uuid()
+        tb.mark_as_done(tid, 1)
+        tb.cleanup()
+        assert tb.get_state(tid) == states.SUCCESS
+
+    def test_cleanup_noop_for_non_memory_backend(self):
+        # real memcached evicts by TTL itself; cleanup must not try to
+        # enumerate it
+        self.tb.backend = 'memcache'
+        self.tb.cleanup()
 
     def test_expires_as_int(self):
         tb = CacheBackend(backend='memory://', expires=10, app=self.app)
