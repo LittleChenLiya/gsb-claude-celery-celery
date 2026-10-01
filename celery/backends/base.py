@@ -849,11 +849,22 @@ class Backend:
         """Hook called before retrying a recoverable backend exception."""
         return None
 
-    def get_task_meta(self, task_id, cache=True):
+    def get_task_meta(self, task_id, cache=True, include_expired=False):
         """Get task meta from backend.
 
         if always_retry_backend_operation is activated, in the event of a recoverable exception,
         then retry operation with an exponential backoff until a limit has been reached.
+
+        Arguments:
+            task_id (str): The task id to look up.
+            cache (bool): If :const:`True`, return a previously cached
+                successful result without hitting the backend.
+            include_expired (bool): If :const:`True`, return the
+                :state:`~celery.states.EXPIRED` state for results that were
+                once stored but have since been cleaned up. When
+                :const:`False` (the default) such results are reported as
+                :state:`~celery.states.PENDING`, matching the historical
+                behavior.
         """
         self._ensure_not_eager()
         if cache:
@@ -868,6 +879,12 @@ class Backend:
             fallback_msg="failed to get meta",
             task_id=task_id
         )
+
+        # By default a cleaned-up result looks the same as one that never
+        # existed, so callers that pre-date the EXPIRED state keep working.
+        if not include_expired and meta.get('status') == states.EXPIRED:
+            meta = dict(meta)
+            meta['status'] = states.PENDING
 
         if cache and meta.get('status') == states.SUCCESS:
             self._cache[task_id] = meta
@@ -884,9 +901,12 @@ class Backend:
 
         Returns:
             bool: :const:`True` if the backend has a result for the task,
-                :const:`False` otherwise.
+                :const:`False` otherwise. A result that was stored and then
+                cleaned up (expired) is reported as not existing, since its
+                value is no longer available.
         """
-        return self._get_task_meta_for(task_id)["status"] != states.PENDING
+        return self._get_task_meta_for(task_id)["status"] not in (
+            states.PENDING, states.EXPIRED)
 
     def reload_group_result(self, group_id):
         """Reload group result, even if it has been previously fetched."""
@@ -1059,8 +1079,9 @@ class SyncBackendMixin:
         time_elapsed = 0.0
 
         while 1:
-            meta = self.get_task_meta(task_id)
-            if meta['status'] in states.READY_STATES:
+            meta = self.get_task_meta(task_id, include_expired=True)
+            if (meta['status'] in states.READY_STATES or
+                    meta['status'] == states.EXPIRED):
                 return meta
             if on_interval:
                 on_interval()
@@ -1097,6 +1118,13 @@ class BaseKeyValueStoreBackend(Backend):
     task_keyprefix = 'celery-task-meta-'
     group_keyprefix = 'celery-taskset-meta-'
     chord_keyprefix = 'chord-unlock-'
+    #: Prefix for the tombstone marker that records a result once existed
+    #: so it can be reported as :state:`~celery.states.EXPIRED` after its
+    #: value has been cleaned up.
+    tombstone_keyprefix = 'celery-task-tombstone-'
+    #: Grace period (in seconds) added to the result TTL before the
+    #: tombstone itself expires. ``None`` keeps tombstones forever.
+    tombstone_ttl_grace = 86400
     implements_incr = False
 
     def __init__(self, *args, **kwargs):
@@ -1127,6 +1155,7 @@ class BaseKeyValueStoreBackend(Backend):
         self.task_keyprefix = self.key_t(self.task_keyprefix)
         self.group_keyprefix = self.key_t(self.group_keyprefix)
         self.chord_keyprefix = self.key_t(self.chord_keyprefix)
+        self.tombstone_keyprefix = self.key_t(self.tombstone_keyprefix)
 
     def get(self, key):
         raise NotImplementedError('Must implement the get method.')
@@ -1139,6 +1168,15 @@ class BaseKeyValueStoreBackend(Backend):
 
     def set(self, key, value):
         raise NotImplementedError('Must implement the set method.')
+
+    def set_with_ttl(self, key, value, ttl):
+        """Set a key with an explicit time-to-live in seconds.
+
+        Backends that support per-key TTL should override this so the
+        tombstone marker can outlive the result value. The default
+        implementation ignores ``ttl`` and stores the key permanently.
+        """
+        return self._set_with_state(key, value, None)
 
     def delete(self, key):
         raise NotImplementedError('Must implement the delete method')
@@ -1166,6 +1204,12 @@ class BaseKeyValueStoreBackend(Backend):
         if not group_id:
             raise ValueError(f'group_id must not be empty. Got {group_id} instead.')
         return self._get_key_for(self.chord_keyprefix, group_id, key)
+
+    def get_key_for_tombstone(self, task_id, key=''):
+        """Get the cache key for the tombstone marker of a task by id."""
+        if not task_id:
+            raise ValueError(f'task_id must not be empty. Got {task_id} instead.')
+        return self._get_key_for(self.tombstone_keyprefix, task_id, key)
 
     def _get_key_for(self, prefix, id, key=''):
         key_t = self.key_t
@@ -1227,11 +1271,19 @@ class BaseKeyValueStoreBackend(Backend):
         time_elapsed = 0.0
         while ids:
             keys = list(ids)
-            r = self._mget_to_results(self.mget([self.get_key_for_task(k)
-                                                 for k in keys]), keys, READY_STATES)
+            mget_values = self.mget([self.get_key_for_task(k) for k in keys])
+            r = self._mget_to_results(mget_values, keys, READY_STATES)
+            # A result whose value has been cleaned up (key gone) is never
+            # going to become ready, so detect it via its tombstone marker
+            # and hand it back as EXPIRED rather than polling forever.
+            expired = self._mget_expired(mget_values, keys)
             cache.update(r)
-            ids.difference_update({bytes_to_str(v) for v in r})
+            ids.difference_update(set(r) | set(expired))
             for key, value in r.items():
+                if on_message is not None:
+                    on_message(value)
+                yield bytes_to_str(key), value
+            for key, value in expired.items():
                 if on_message is not None:
                     on_message(value)
                 yield bytes_to_str(key), value
@@ -1255,8 +1307,28 @@ class BaseKeyValueStoreBackend(Backend):
             if max_iterations and iterations >= max_iterations:
                 break
 
+    def _mget_expired(self, values, keys):
+        """Return a mapping of task_id to EXPIRED meta for results whose
+        value key is gone but whose tombstone marker still exists."""
+        if hasattr(values, 'items'):
+            present = {self._strip_prefix(k) for k, v in values.items()
+                       if v is not None}
+        else:
+            present = {bytes_to_str(keys[i]) for i, v in enumerate(values)
+                       if v is not None}
+        expired = {}
+        for task_id in keys:
+            tid = bytes_to_str(task_id)
+            if tid in present:
+                continue
+            if self.get(self.get_key_for_tombstone(task_id)) is not None:
+                expired[tid] = {'status': states.EXPIRED, 'result': None,
+                                'task_id': tid}
+        return expired
+
     def _forget(self, task_id):
         self.delete(self.get_key_for_task(task_id))
+        self.delete(self.get_key_for_tombstone(task_id))
 
     def _store_result(self, task_id, result, state,
                       traceback=None, request=None, **kwargs):
@@ -1277,10 +1349,32 @@ class BaseKeyValueStoreBackend(Backend):
 
         try:
             self._set_with_state(self.get_key_for_task(task_id), self.encode(meta), state)
+            self._set_tombstone(task_id)
         except BackendStoreError as ex:
             raise BackendStoreError(str(ex), state=state, task_id=task_id) from ex
 
         return result
+
+    def _set_tombstone(self, task_id):
+        """Record that a result once existed for ``task_id``.
+
+        The tombstone outlives the result value so that a result which has
+        been cleaned up (TTL expired) can still be reported as
+        :state:`~celery.states.EXPIRED` instead of looking like it never
+        existed.
+        """
+        ttl = self._tombstone_ttl()
+        self.set_with_ttl(self.get_key_for_tombstone(task_id),
+                          bytes_to_str(task_id), ttl)
+
+    def _tombstone_ttl(self):
+        """TTL for the tombstone marker, in seconds.
+
+        Returns :const:`None` for a permanent tombstone.
+        """
+        if self.expires is None:
+            return None
+        return self.expires + self.tombstone_ttl_grace
 
     def _save_group(self, group_id, result):
         self._set_with_state(self.get_key_for_group(group_id),
@@ -1294,6 +1388,13 @@ class BaseKeyValueStoreBackend(Backend):
         """Get task meta-data for a task by id."""
         meta = self.get(self.get_key_for_task(task_id))
         if not meta:
+            # The result value is gone. If a tombstone marker remains, the
+            # result was once stored and has since been cleaned up; otherwise
+            # no result was ever stored for this task id.
+            tombstone = self.get(self.get_key_for_tombstone(task_id))
+            if tombstone is not None:
+                return {'status': states.EXPIRED, 'result': None,
+                        'task_id': bytes_to_str(task_id)}
             return {'status': states.PENDING, 'result': None}
         return self.decode_result(meta)
 

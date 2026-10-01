@@ -1332,6 +1332,22 @@ Task has been revoked.
 
 :propagates: Yes
 
+.. state:: EXPIRED
+
+EXPIRED
+~~~~~~~
+
+The task result has expired.
+
+A result is ``EXPIRED`` when it was once stored in the backend but has since
+been cleaned up (for example by a time-to-live). This is distinct from
+``PENDING``, which means no result has ever been stored for the task id.
+The result backend only reports ``EXPIRED`` when asked with
+``include_expired=True``; by default such results are reported as
+``PENDING`` to preserve backwards compatibility.
+
+:propagates: No
+
 .. _custom-states:
 
 Custom states

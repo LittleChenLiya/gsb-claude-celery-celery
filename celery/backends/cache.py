@@ -125,6 +125,9 @@ class CacheBackend(KeyValueStoreBackend):
     def set(self, key, value):
         return self.client.set(key, value, self.expires)
 
+    def set_with_ttl(self, key, value, ttl):
+        return self.client.set(key, value, ttl)
+
     def delete(self, key):
         return self.client.delete(key)
 

@@ -703,6 +703,13 @@ class RedisBackend(BaseKeyValueStoreBackend, AsyncBackendMixin):
 
         return self.ensure(self._set, (key, value), **retry_policy)
 
+    def set_with_ttl(self, key, value, ttl):
+        # The tombstone marker is not a result update, so it is stored
+        # directly without publishing to the result pub/sub channel.
+        if ttl:
+            return self.client.setex(key, ttl, value)
+        return self.client.set(key, value)
+
     def _set(self, key, value):
         with self.client.pipeline() as pipe:
             if self.expires:

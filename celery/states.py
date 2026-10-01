@@ -54,7 +54,8 @@ Misc
 
 __all__ = (
     'PENDING', 'RECEIVED', 'STARTED', 'SUCCESS', 'FAILURE',
-    'REVOKED', 'RETRY', 'IGNORED', 'READY_STATES', 'UNREADY_STATES',
+    'REVOKED', 'RETRY', 'IGNORED', 'EXPIRED',
+    'READY_STATES', 'UNREADY_STATES',
     'EXCEPTION_STATES', 'PROPAGATE_STATES', 'precedence', 'state',
 )
 
@@ -141,11 +142,18 @@ REJECTED = 'REJECTED'
 RETRY = 'RETRY'
 IGNORED = 'IGNORED'
 
+#: Task result has expired.
+#:
+#: A result is ``EXPIRED`` when it was once stored in the backend but has
+#: since been cleaned up (e.g. by a TTL). This is distinct from ``PENDING``,
+#: which means no result has ever been stored for the task id.
+EXPIRED = 'EXPIRED'
+
 READY_STATES = frozenset({SUCCESS, FAILURE, REVOKED})
 UNREADY_STATES = frozenset({PENDING, RECEIVED, STARTED, REJECTED, RETRY})
 EXCEPTION_STATES = frozenset({RETRY, FAILURE, REVOKED})
 PROPAGATE_STATES = frozenset({FAILURE, REVOKED})
 
 ALL_STATES = frozenset({
-    PENDING, RECEIVED, STARTED, SUCCESS, FAILURE, RETRY, REVOKED,
+    PENDING, RECEIVED, STARTED, SUCCESS, FAILURE, RETRY, REVOKED, EXPIRED,
 })
