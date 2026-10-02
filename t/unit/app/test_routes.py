@@ -1,4 +1,4 @@
-from unittest.mock import ANY, Mock
+from unittest.mock import ANY, Mock, patch
 
 import pytest
 from kombu import Exchange, Queue
@@ -232,3 +232,136 @@ class test_prepare:
         R = {'foo': 'bar'}
         p = routes.prepare(R)
         assert isinstance(p[0], routes.MapRoute)
+
+
+class test_router_explain(RouteCase):
+    """Tests for Router.explain() -- read-only route selection explanation."""
+
+    def setup_method(self):
+        super().setup_method()
+        set_queues(
+            self.app, foo=self.a_queue, bar=self.b_queue,
+            **{self.app.conf.task_default_queue: self.d_queue})
+
+    def _router(self, route_map):
+        R = routes.prepare((route_map,))
+        return Router(self.app, R, self.app.amqp.queues)
+
+    def test_explain_wildcard(self):
+        router = self._router({'proj.tasks.bar*': {'queue': 'bar'}})
+        info = router.explain('proj.tasks.bar.baz')
+        assert info['matched'] is True
+        assert info['router_index'] == 0
+        assert info['rule'] == 'proj.tasks.bar*'
+        assert info['route'] == {'queue': 'bar'}
+        assert info['queue'] == 'bar'
+        assert info['default'] is False
+        assert info['default_source'] is None
+
+    def test_explain_exact(self):
+        router = self._router({'proj.tasks.foo': {'queue': 'foo'}})
+        info = router.explain('proj.tasks.foo')
+        assert info['matched'] is True
+        assert info['rule'] == 'proj.tasks.foo'
+        assert info['route'] == {'queue': 'foo'}
+        assert info['queue'] == 'foo'
+        assert info['default'] is False
+        assert info['default_source'] is None
+
+    def test_explain_default_unmatched(self):
+        router = self._router({'proj.tasks.foo': {'queue': 'foo'}})
+        default_name = self.app.conf.task_default_queue
+        info = router.explain('proj.tasks.unknown')
+        assert info['matched'] is False
+        assert info['router_index'] is None
+        assert info['rule'] is None
+        assert info['route'] is None
+        assert info['default'] is True
+        assert info['queue'] == default_name
+        assert 'task_default_queue' in info['default_source']
+        assert default_name in info['default_source']
+
+    def test_explain_matches_actual_routing_item_by_item(self):
+        router = self._router({
+            'proj.tasks.bar*': {'queue': 'bar'},   # wildcard
+            'proj.tasks.foo': {'queue': 'foo'},     # exact
+        })
+        default_name = self.app.conf.task_default_queue
+        cases = [
+            ('proj.tasks.bar', 'bar'),
+            ('proj.tasks.bar.baz', 'bar'),
+            ('proj.tasks.foo', 'foo'),
+            ('proj.tasks.other', default_name),
+            ('celery.unrelated', default_name),
+        ]
+        for name, expected in cases:
+            info = router.explain(name)
+            actual = router.route({}, name)
+            # explanation and actual routing must agree on the queue
+            assert info['queue'] == expected, name
+            assert actual['queue'].name == expected, name
+            assert info['queue'] == actual['queue'].name, name
+
+    def test_explain_does_not_mutate_cache(self):
+        router = self._router({'proj.tasks.foo': {'queue': 'foo'}})
+        before = {k: v.name for k, v in router.queues.items()}
+        router.explain('proj.tasks.unknown')
+        router.explain('proj.tasks.foo')
+        after = {k: v.name for k, v in router.queues.items()}
+        assert after == before
+
+    def test_explain_does_not_create_missing_queue(self):
+        # route() with create_missing=True would add 'newq' to the cache;
+        # explain() must report the name without mutating the cache.
+        router = Router(
+            self.app,
+            routes.prepare(({'proj.tasks.new': {'queue': 'newq'}},)),
+            self.app.amqp.queues, create_missing=True,
+        )
+        before = set(router.queues)
+        info = router.explain('proj.tasks.new')
+        assert info['matched'] is True
+        assert info['queue'] == 'newq'
+        assert set(router.queues) == before
+        assert 'newq' not in router.queues
+
+    def test_explain_does_not_publish(self):
+        router = self._router({'proj.tasks.foo': {'queue': 'foo'}})
+        with patch.object(self.app, 'send_task') as send_task:
+            router.explain('proj.tasks.foo')
+            router.explain('proj.tasks.unknown')
+            send_task.assert_not_called()
+
+    def test_explain_with_options_queue(self):
+        router = self._router({'proj.tasks.foo': {'queue': 'foo'}})
+        info = router.explain('proj.tasks.foo', options={'queue': 'bar'})
+        assert info['matched'] is True
+        # options' queue takes precedence, mirroring route()
+        assert info['queue'] == 'bar'
+
+    def test_explain_with_options_queue_unmatched(self):
+        router = self._router({'proj.tasks.foo': {'queue': 'foo'}})
+        info = router.explain('proj.tasks.unknown', options={'queue': 'bar'})
+        assert info['default'] is True
+        assert info['queue'] == 'bar'
+        assert 'options.queue' in info['default_source']
+
+    def test_explain_compiled_regex(self):
+        from re import compile
+        pattern = compile(r'video\.tasks\..*')
+        router = self._router({pattern: {'queue': 'bar'}})
+        info = router.explain('video.tasks.foo')
+        assert info['matched'] is True
+        assert info['rule'] == pattern.pattern
+        assert info['queue'] == 'bar'
+
+    def test_explain_custom_router(self):
+        router = self._router(TestRouter())
+        info = router.explain('celery.xaza')
+        assert info['matched'] is True
+        assert info['rule'] is None
+        assert info['queue'] == 'bar'
+        info = router.explain('celery.other')
+        assert info['matched'] is False
+        assert info['default'] is True
+        assert info['queue'] == self.app.conf.task_default_queue
