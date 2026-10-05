@@ -577,6 +577,27 @@ class Signature(dict):
     def set_immutable(self, immutable):
         self.immutable = immutable
 
+    def propagate_headers(self, policy):
+        """Return a copy of this canvas with headers explicitly propagated.
+
+        Applies a :class:`HeaderPropagationPolicy` so that only allow-listed
+        header keys flow from this signature into its real children
+        (chain/group tasks, chord header tasks and chord body), with each
+        child's own explicit header values taking priority.
+
+        Neither this signature nor its ``options['headers']`` mapping is
+        modified: a propagated copy is returned instead.
+
+        Arguments:
+            policy (Union[HeaderPropagationPolicy, Iterable[str]]):
+                The propagation policy, or an iterable of allowed header
+                keys from which a policy is built.
+
+        Returns:
+            Signature: propagated copy of this signature.
+        """
+        return propagate_headers(self, policy)
+
     def _stamp_headers(self, visitor_headers=None, append_stamps=False, self_headers=True, **headers):
         """Collect all stamps from visitor, headers and self,
         and return an idempotent dictionary of stamps.
@@ -2467,6 +2488,210 @@ class _chord(Signature):
 # Add a back-compat alias for the previous `chord` class name which conflicts
 # with keyword arguments elsewhere in this file
 chord = _chord
+
+
+#: Message header keys owned by the Celery wire protocol and by the
+#: canvas runtime itself.  Business header propagation must never
+#: carry -- let alone override -- these protocol fields, so they are
+#: rejected from propagation policies and filtered out of inherited
+#: (parent-side) headers.  A child's *own* explicitly set protocol
+#: fields are always preserved as-is.
+RESERVED_HEADER_KEYS = frozenset({
+    # protocol v2 message headers (see celery.app.amqp.as_task_v2)
+    'id', 'task', 'lang', 'shadow', 'eta', 'expires', 'utc',
+    'group', 'group_index', 'retries', 'timelimit',
+    'root_id', 'parent_id', 'argsrepr', 'kwargsrepr',
+    'origin', 'ignore_result', 'stamped_headers', 'stamps',
+    # protocol v1 embedding fields
+    'callbacks', 'errbacks', 'chain', 'chord',
+    # canvas runtime bookkeeping
+    'headers', 'replaced_task_nesting', 'milestone',
+})
+
+
+class HeaderPropagationPolicy:
+    """Explicit allow-list policy for canvas header propagation.
+
+    Only header keys named in ``allowed_keys`` may flow from a parent
+    signature into its children; everything else stays on the parent.
+    The policy never mutates the mappings it is given: both
+    :meth:`filter` and :meth:`merge` return new dictionaries.
+
+    Protocol fields (:data:`RESERVED_HEADER_KEYS`) are owned by Celery
+    and cannot be allow-listed: attempting to do so raises
+    :exc:`ValueError` so business propagation can never override them.
+
+    Example:
+        >>> policy = HeaderPropagationPolicy(['tenant'])
+        >>> policy.merge({'tenant': 'acme', 'debug': True}, {'tenant': 'eu'})
+        {'tenant': 'eu'}
+    """
+
+    def __init__(self, allowed_keys=()):
+        allowed = frozenset(allowed_keys or ())
+        reserved = allowed & RESERVED_HEADER_KEYS
+        if reserved:
+            raise ValueError(
+                'header propagation may not allow reserved protocol '
+                f'header keys: {sorted(reserved)!r}')
+        self.allowed_keys = allowed
+
+    def __repr__(self):
+        return (f'{type(self).__name__}('
+                f'allowed_keys={sorted(self.allowed_keys)!r})')
+
+    def __eq__(self, other):
+        if isinstance(other, HeaderPropagationPolicy):
+            return self.allowed_keys == other.allowed_keys
+        return NotImplemented
+
+    def __hash__(self):
+        return hash(self.allowed_keys)
+
+    def filter(self, headers):
+        """Return the allow-listed subset of ``headers`` as a new dict."""
+        if not headers:
+            return {}
+        return {key: value for key, value in headers.items()
+                if key in self.allowed_keys}
+
+    def merge(self, inherited, explicit):
+        """Merge parent-inherited headers with a child's explicit headers.
+
+        Only allow-listed keys are taken from ``inherited``; every key in
+        ``explicit`` (including the child's own protocol fields) is kept
+        and wins over an inherited value of the same key.
+
+        Returns a new dict; neither argument is modified.
+        """
+        merged = self.filter(inherited)
+        if explicit:
+            merged.update(explicit)
+        return merged
+
+
+def _ensure_policy(policy):
+    if isinstance(policy, HeaderPropagationPolicy):
+        return policy
+    return HeaderPropagationPolicy(policy)
+
+
+def _signature_tasks(sig):
+    """Child signatures of a container, as Signature objects."""
+    return [task if isinstance(task, abstract.CallableSignature)
+            else maybe_signature(task) for task in sig.tasks]
+
+
+def _copy_with_headers(sig, headers):
+    """Clone ``sig`` and set ``options['headers']`` on the clone only."""
+    clone = sig.clone()
+    if headers:
+        # clone() deep-copies options, so this never touches the source.
+        clone.options['headers'] = dict(headers)
+    return clone
+
+
+def _propagate(sig, policy, inherited):
+    """Return a propagated copy of ``sig`` (the source is never mutated).
+
+    ``inherited`` holds the headers flowing in from the parent; the
+    signature's own explicit ``options['headers']`` always win.  Container
+    primitives forward their *effective* headers (allow-listed again) to
+    their real children: chain and group to their tasks, chord to both
+    its header tasks and its body.
+    """
+    own_headers = sig.options.get('headers') if sig.options else None
+    effective = policy.merge(inherited, own_headers)
+    if isinstance(sig, _chord):
+        return _propagate_chord(sig, policy, effective)
+    if isinstance(sig, group):
+        return _propagate_group(sig, policy, effective)
+    if isinstance(sig, _chain):
+        return _propagate_chain(sig, policy, effective)
+    return _copy_with_headers(sig, effective)
+
+
+def _propagate_container(sig, effective):
+    clone = sig.clone()
+    if effective:
+        # the container is itself a child of its parent
+        clone.options['headers'] = dict(effective)
+    return clone
+
+
+def _propagate_chain(sig, policy, effective):
+    clone = _propagate_container(sig, effective)
+    inherited = policy.filter(effective)
+    clone.kwargs['tasks'] = [
+        _propagate(task, policy, inherited)
+        for task in _signature_tasks(sig)
+    ]
+    return clone
+
+
+def _propagate_group(sig, policy, effective):
+    clone = _propagate_container(sig, effective)
+    inherited = policy.filter(effective)
+    clone.kwargs['tasks'] = [
+        _propagate(task, policy, inherited)
+        for task in _signature_tasks(sig)
+    ]
+    return clone
+
+
+def _propagate_chord(sig, policy, effective):
+    clone = _propagate_container(sig, effective)
+    inherited = policy.filter(effective)
+    header = sig.kwargs.get('header')
+    if header is not None:
+        if isinstance(header, abstract.CallableSignature):
+            clone.kwargs['header'] = _propagate(header, policy, inherited)
+        else:
+            # ``chord`` stores its header as a sequence of signatures
+            # (see ``_maybe_group``); propagate into each element while
+            # preserving the container type.
+            propagated = [
+                _propagate(
+                    task if isinstance(task, abstract.CallableSignature)
+                    else maybe_signature(task),
+                    policy, inherited)
+                for task in header
+            ]
+            clone.kwargs['header'] = (
+                propagated if isinstance(header, list)
+                else type(header)(propagated))
+    body = sig.kwargs.get('body')
+    if body is not None:
+        if not isinstance(body, abstract.CallableSignature):
+            body = maybe_signature(body)
+        clone.kwargs['body'] = _propagate(body, policy, inherited)
+    return clone
+
+
+def propagate_headers(sig, policy):
+    """Return a copy of canvas ``sig`` with explicitly propagated headers.
+
+    Only keys allowed by ``policy`` (a
+    :class:`HeaderPropagationPolicy` or an iterable of allowed key names)
+    flow from each parent signature into its children, following the real
+    child relationships of the canvas:
+
+    - :class:`chain`: every task in the chain;
+    - :class:`group`: every member task;
+    - :class:`chord`: every header task *and* the body;
+    - nested primitives are descended recursively.
+
+    A child's own explicit ``options['headers']`` values always take
+    priority over inherited ones, and protocol fields listed in
+    :data:`RESERVED_HEADER_KEYS` can neither be propagated nor overridden
+    by propagation.  ``immutable`` signatures are treated like any other
+    leaf: header propagation never touches ``args``/``kwargs``, so
+    immutability keeps its exact parameter semantics.
+
+    The source signature and its header mappings are never modified in
+    place; a propagated copy is returned.
+    """
+    return _propagate(sig, _ensure_policy(policy), None)
 
 
 def signature(varies, *args, **kwargs):

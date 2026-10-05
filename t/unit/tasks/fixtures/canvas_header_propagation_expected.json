@@ -1,0 +1,127 @@
+{
+  "task": "celery.chain",
+  "args": [],
+  "kwargs": {
+    "tasks": [
+      {
+        "task": "celery.group",
+        "args": [],
+        "kwargs": {
+          "tasks": [
+            {
+              "task": "biz.sync_account",
+              "args": [
+                1,
+                2
+              ],
+              "kwargs": {},
+              "options": {
+                "headers": {
+                  "tenant": "child-a"
+                }
+              },
+              "subtask_type": null,
+              "immutable": false
+            },
+            {
+              "task": "biz.sync_account",
+              "args": [
+                3,
+                4
+              ],
+              "kwargs": {},
+              "options": {
+                "headers": {
+                  "tenant": "acme"
+                }
+              },
+              "subtask_type": null,
+              "immutable": false
+            }
+          ]
+        },
+        "options": {
+          "headers": {
+            "tenant": "acme"
+          }
+        },
+        "subtask_type": "group",
+        "immutable": false
+      },
+      {
+        "task": "celery.chord",
+        "args": [],
+        "kwargs": {
+          "kwargs": {},
+          "header": [
+            {
+              "task": "biz.ping",
+              "args": [],
+              "kwargs": {},
+              "options": {
+                "headers": {
+                  "tenant": "acme"
+                }
+              },
+              "subtask_type": null,
+              "immutable": false
+            },
+            {
+              "task": "biz.pong",
+              "args": [],
+              "kwargs": {},
+              "options": {
+                "headers": {
+                  "tenant": "acme"
+                }
+              },
+              "subtask_type": null,
+              "immutable": false
+            }
+          ],
+          "body": {
+            "task": "biz.done",
+            "args": [],
+            "kwargs": {},
+            "options": {
+              "headers": {
+                "tenant": "body-tenant"
+              }
+            },
+            "subtask_type": null,
+            "immutable": false
+          }
+        },
+        "options": {
+          "headers": {
+            "tenant": "acme"
+          }
+        },
+        "subtask_type": "chord",
+        "immutable": false
+      },
+      {
+        "task": "biz.final",
+        "args": [
+          9
+        ],
+        "kwargs": {},
+        "options": {
+          "headers": {
+            "tenant": "acme"
+          }
+        },
+        "subtask_type": null,
+        "immutable": true
+      }
+    ]
+  },
+  "options": {
+    "headers": {
+      "tenant": "acme",
+      "debug": true
+    }
+  },
+  "subtask_type": "chain",
+  "immutable": false
+}

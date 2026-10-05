@@ -14,6 +14,7 @@
     tasks
     calling
     canvas
+    canvas-header-propagation
     workers
     daemonizing
     periodic-tasks
