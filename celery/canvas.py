@@ -23,8 +23,9 @@ from kombu.utils.objects import cached_property
 from kombu.utils.uuid import uuid
 from vine import barrier
 
-from celery._state import current_app
+from celery._state import current_app, _task_stack
 from celery.exceptions import CPendingDeprecationWarning
+from celery.lineage import Lineage
 from celery.result import EagerResult, GroupResult, allow_join_result
 from celery.states import IGNORED, REJECTED
 from celery.utils import abstract
@@ -497,7 +498,7 @@ class Signature(dict):
     partial = clone
 
     def freeze(self, _id=None, group_id=None, chord=None,
-               root_id=None, parent_id=None, group_index=None):
+               root_id=None, parent_id=None, group_index=None, lineage=None):
         """Finalize the signature by adding a concrete task id.
 
         The task won't be called and you shouldn't call the signature
@@ -515,6 +516,9 @@ class Signature(dict):
             root_id (str): Root id to use.
             parent_id (str): Parent id to use.
             group_index (int): Group index to use.
+            lineage (Lineage): Logical call lineage to record.  When provided,
+                the lineage is stored under the ``lineage`` option as a plain
+                dict (see :mod:`celery.lineage` for the field description).
 
         Returns:
             ~@AsyncResult: promise of future evaluation.
@@ -532,6 +536,10 @@ class Signature(dict):
             opts['root_id'] = root_id
         if parent_id:
             opts['parent_id'] = parent_id
+        if lineage is not None:
+            # Store as a plain dict so the signature remains JSON-serializable
+            # when it is sent to the broker.
+            opts['lineage'] = lineage.to_dict() if hasattr(lineage, 'to_dict') else lineage
         if 'reply_to' not in opts:
             # fall back on unique ID for this thread in the app
             opts['reply_to'] = self.app.thread_oid
@@ -1126,7 +1134,7 @@ class _chain(Signature):
     # in order for a chain to be frozen, each of the members of the chain individually needs to be frozen
     # TODO figure out why we are always cloning before freeze
     def freeze(self, _id=None, group_id=None, chord=None,
-               root_id=None, parent_id=None, group_index=None):
+               root_id=None, parent_id=None, group_index=None, lineage=None):
         # pylint: disable=redefined-outer-name
         #   XXX chord is also a class in outer scope.
         _, results = self._frozen = self.prepare_steps(
@@ -1196,6 +1204,17 @@ class _chain(Signature):
         if use_link is None and app.conf.task_protocol == 1:
             use_link = True
         steps = deque(tasks)
+
+        # A chain step creates a child logical call: each task in the chain
+        # gets a fresh call_id with the parent call's call_id as
+        # parent_call_id.  The parent's lineage is taken from the currently
+        # executing task's request context when available.
+        parent_lineage = None
+        parent_task = _task_stack.top
+        if parent_task is not None and getattr(parent_task, 'request', None):
+            parent_lineage = getattr(parent_task.request, 'lineage', None)
+        if parent_lineage is None:
+            parent_lineage = Lineage.initial()
 
         # The reverse walk below identifies the chain's first task -- the one
         # that receives the partial ``args``/``kwargs`` -- by ``not steps``.
@@ -1297,6 +1316,10 @@ class _chain(Signature):
                 # when use_link/task_protocol==1.
                 prev_task = tasks[-1] if tasks else None
 
+            # Each chain step is an independent child call: create a fresh
+            # lineage for this task, parented to the chain's parent call.
+            step_lineage = parent_lineage.child(source='chain')
+
             if is_last_task:
                 # chain(task_id=id) means task id is set for the last task
                 # in the chain.  If the chord is part of a chord/group
@@ -1306,10 +1329,10 @@ class _chain(Signature):
                 res = task.freeze(
                     last_task_id,
                     root_id=root_id, group_id=group_id, chord=chord_body,
-                    group_index=group_index,
+                    group_index=group_index, lineage=step_lineage,
                 )
             else:
-                res = task.freeze(root_id=root_id)
+                res = task.freeze(root_id=root_id, lineage=step_lineage)
 
             i += 1
 
@@ -1959,7 +1982,7 @@ class group(Signature):
         return gid, results
 
     def freeze(self, _id=None, group_id=None, chord=None,
-               root_id=None, parent_id=None, group_index=None):
+               root_id=None, parent_id=None, group_index=None, lineage=None):
         return self.app.GroupResult(*self._freeze_group_tasks(
             _id=_id, group_id=group_id,
             chord=chord, root_id=root_id, parent_id=parent_id, group_index=group_index
@@ -2169,7 +2192,7 @@ class _chord(Signature):
             return super().__or__(other)
 
     def freeze(self, _id=None, group_id=None, chord=None,
-               root_id=None, parent_id=None, group_index=None):
+               root_id=None, parent_id=None, group_index=None, lineage=None):
         # pylint: disable=redefined-outer-name
         #   XXX chord is also a class in outer scope.
         if not isinstance(self.tasks, group):

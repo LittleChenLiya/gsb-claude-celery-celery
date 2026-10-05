@@ -11,6 +11,7 @@ from kombu.utils.functional import maybe_list
 from kombu.utils.objects import cached_property
 
 from celery import signals
+from celery.lineage import LINEAGE_HEADER, lineage_to_headers
 from celery.utils.nodenames import anon_nodename
 from celery.utils.saferepr import saferepr
 from celery.utils.text import indent as textindent
@@ -332,7 +333,14 @@ class AMQP:
                    create_sent_event=False, root_id=None, parent_id=None,
                    shadow=None, chain=None, now=None, timezone=None,
                    origin=None, ignore_result=False, argsrepr=None, kwargsrepr=None, stamped_headers=None,
-                   replaced_task_nesting=0, **options):
+                   replaced_task_nesting=0, lineage=None, **options):
+        """Create a task message using protocol version 2.
+
+        Arguments:
+            lineage (Lineage): Optional logical call lineage record.  When
+                provided, the lineage is stored under the ``lineage`` message
+                header.  See :mod:`celery.lineage` for the field description.
+        """
 
         args = args or ()
         kwargs = kwargs or {}
@@ -369,6 +377,7 @@ class AMQP:
             root_id = task_id
 
         stamps = {header: options[header] for header in stamped_headers or []}
+        lineage_headers = lineage_to_headers(lineage)
         headers = {
             'lang': 'py',
             'task': name,
@@ -390,6 +399,8 @@ class AMQP:
             'stamped_headers': stamped_headers,
             'stamps': stamps,
         }
+        if lineage_headers is not None:
+            headers[LINEAGE_HEADER] = lineage_headers
 
         return task_message(
             headers=headers,
@@ -425,7 +436,7 @@ class AMQP:
                    time_limit=None, soft_time_limit=None,
                    create_sent_event=False, root_id=None, parent_id=None,
                    shadow=None, now=None, timezone=None,
-                   **compat_kwargs):
+                   lineage=None, **compat_kwargs):
         args = args or ()
         kwargs = kwargs or {}
         utc = self.utc
@@ -444,29 +455,34 @@ class AMQP:
         eta = eta and eta.isoformat()
         expires = expires and expires.isoformat()
 
+        body = {
+            'task': name,
+            'id': task_id,
+            'args': args,
+            'kwargs': kwargs,
+            'group': group_id,
+            'group_index': group_index,
+            'retries': retries,
+            'eta': eta,
+            'expires': expires,
+            'utc': utc,
+            'callbacks': callbacks,
+            'errbacks': errbacks,
+            'timelimit': (time_limit, soft_time_limit),
+            'taskset': group_id,
+            'chord': chord,
+        }
+        lineage_headers = lineage_to_headers(lineage)
+        if lineage_headers is not None:
+            body[LINEAGE_HEADER] = lineage_headers
+
         return task_message(
             headers={},
             properties={
                 'correlation_id': task_id,
                 'reply_to': reply_to or '',
             },
-            body={
-                'task': name,
-                'id': task_id,
-                'args': args,
-                'kwargs': kwargs,
-                'group': group_id,
-                'group_index': group_index,
-                'retries': retries,
-                'eta': eta,
-                'expires': expires,
-                'utc': utc,
-                'callbacks': callbacks,
-                'errbacks': errbacks,
-                'timelimit': (time_limit, soft_time_limit),
-                'taskset': group_id,
-                'chord': chord,
-            },
+            body=body,
             sent_event={
                 'uuid': task_id,
                 'name': name,

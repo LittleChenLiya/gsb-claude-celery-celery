@@ -10,6 +10,7 @@ from kombu.utils.uuid import uuid
 from celery import current_app, states
 from celery._state import _task_stack
 from celery.canvas import _chain, group, signature
+from celery.lineage import Lineage, validate_lineage
 from celery.exceptions import Ignore, ImproperlyConfigured, MaxRetriesExceededError, Reject, Retry
 from celery.local import class_property
 from celery.result import EagerResult, denied_join_result
@@ -95,6 +96,7 @@ class Context:
     ignore_result = False
     is_eager = False
     kwargs = None
+    lineage = None
     logfile = None
     loglevel = None
     origin = None
@@ -167,6 +169,9 @@ class Context:
 
     def as_execution_options(self):
         limit_hard, limit_soft = self.timelimit or (None, None)
+        lineage = self.lineage
+        if lineage is not None and hasattr(lineage, 'to_dict'):
+            lineage = lineage.to_dict()
         execution_options = {
             'task_id': self.id,
             'root_id': self.root_id,
@@ -186,6 +191,7 @@ class Context:
             'reply_to': self.reply_to,
             'replaced_task_nesting': self.replaced_task_nesting,
             'origin': self.origin,
+            'lineage': lineage,
         }
         if hasattr(self, 'stamps') and hasattr(self, 'stamped_headers'):
             if self.stamps is not None and self.stamped_headers is not None:
@@ -842,10 +848,30 @@ class Task:
         if not eta and countdown is None:
             countdown = self.default_retry_delay
 
+        # Continue the same logical call: a retry keeps the call_id and only
+        # increments the attempt number.  When no lineage was recorded (older
+        # messages or callers that opted out), start a fresh lineage so the
+        # retry is still traceable.
+        current_lineage = request.lineage
+        if current_lineage is None:
+            retry_lineage = Lineage.initial().retry()
+        else:
+            retry_lineage = current_lineage.retry()
+        lineage_diagnostic = validate_lineage(retry_lineage)
+        if lineage_diagnostic is not None:
+            # A malformed retry lineage is a diagnostic only: it must not
+            # change the broker ack or retry count, so we log it and continue
+            # with the retry rather than raising.
+            self._get_app().logger.warning(
+                'Retry lineage diagnostic for %s[%s]: %s',
+                self.name, request.id, lineage_diagnostic,
+            )
+
         is_eager = request.is_eager
         S = self.signature_from_request(
             request, args, kwargs,
             countdown=countdown, eta=eta, retries=retries,
+            lineage=retry_lineage.to_dict(),
             **options
         )
 

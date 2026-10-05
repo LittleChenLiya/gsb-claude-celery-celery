@@ -1103,6 +1103,7 @@ class Celery:
                                        parent.request.delivery_info.get('priority'))
 
         # alias for 'task_as_v2'
+        lineage = options.pop('lineage', None)
         message = amqp.create_task_message(
             task_id, name, args, kwargs, countdown, eta, group_id, group_index,
             expires, retries, chord,
@@ -1111,7 +1112,8 @@ class Celery:
             self.conf.task_send_sent_event,
             root_id, parent_id, shadow, chain,
             ignore_result=ignore_result,
-            replaced_task_nesting=replaced_task_nesting, **options
+            replaced_task_nesting=replaced_task_nesting,
+            lineage=lineage, **options
         )
 
         stamped_headers = options.pop('stamped_headers', [])

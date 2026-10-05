@@ -20,6 +20,7 @@ from celery.app.trace import fast_trace_task, task_has_custom, trace_task, trace
 from celery.concurrency.base import BasePool
 from celery.exceptions import (Ignore, InvalidTaskError, Reject, Retry, TaskRevokedError, Terminated,
                                TimeLimitExceeded, WorkerLostError)
+from celery.lineage import LINEAGE_HEADER, Lineage, lineage_from_headers, validate_lineage
 from celery.platforms import signals as _signals
 from celery.utils.functional import maybe, maybe_list, noop
 from celery.utils.log import get_logger
@@ -120,6 +121,8 @@ class Request:
             self.name = self._request_dict['shadow'] or self.name
         self._root_id = self._request_dict.get('root_id')
         self._parent_id = self._request_dict.get('parent_id')
+        self._lineage = lineage_from_headers(self._request_dict)
+        self._lineage_diagnostic = validate_lineage(self._lineage)
         timelimit = self._request_dict.get('timelimit', None)
         if timelimit:
             self.time_limits = timelimit
@@ -223,6 +226,20 @@ class Request:
     @property
     def parent_id(self):
         return self._parent_id
+
+    @property
+    def lineage(self):
+        """Logical call lineage recorded on the message, or ``None``."""
+        return self._lineage
+
+    @property
+    def lineage_diagnostic(self):
+        """Diagnostic string for a malformed lineage, or ``None``.
+
+        The diagnostic is purely informational: it does not ack/reject the
+        message or change the retry count.
+        """
+        return self._lineage_diagnostic
 
     @property
     def argsrepr(self):
@@ -783,7 +800,7 @@ class Request:
             self.send_event('task-rejected', requeue=requeue)
 
     def info(self, safe=False):
-        return {
+        info = {
             'id': self.id,
             'name': self.name,
             'args': self._args if not safe else self._argsrepr,
@@ -795,6 +812,11 @@ class Request:
             'delivery_info': self.delivery_info,
             'worker_pid': self.worker_pid,
         }
+        if self._lineage is not None:
+            info['lineage'] = self._lineage.to_dict()
+        if self._lineage_diagnostic is not None:
+            info['lineage_diagnostic'] = self._lineage_diagnostic
+        return info
 
     def humaninfo(self):
         return '{0.name}[{0.id}]'.format(self)
@@ -850,6 +872,12 @@ class Request:
         #    payload is a property, so pylint doesn't think it's a tuple.
         _, _, embed = self._payload
         request.update(**embed or {})
+        # The lineage header is stored as a plain dict on the wire; convert
+        # it back to a :class:`Lineage` so callers can use :meth:`Lineage.retry`
+        # and :meth:`Lineage.child` directly.
+        lineage = request.get(LINEAGE_HEADER)
+        if lineage is not None and not isinstance(lineage, Lineage):
+            request[LINEAGE_HEADER] = lineage_from_headers(request)
         return Context(request)
 
     @cached_property
