@@ -1,0 +1,17 @@
+{
+  "id": "parent-task-id",
+  "task": "tasks.add",
+  "args": [
+    1,
+    2
+  ],
+  "kwargs": {},
+  "headers": {
+    "tenant": "acme",
+    "debug": true
+  },
+  "properties": {
+    "correlation_id": "parent-task-id",
+    "reply_to": "reply-queue"
+  }
+}

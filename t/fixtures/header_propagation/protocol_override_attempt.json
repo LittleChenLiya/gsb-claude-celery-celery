@@ -1,0 +1,18 @@
+{
+  "id": "child-task-id",
+  "task": "tasks.add",
+  "args": [
+    3
+  ],
+  "kwargs": {},
+  "headers": {
+    "tenant": "acme",
+    "task_id": "overridden-task-id",
+    "group_id": "overridden-group-id",
+    "chord": "overridden-chord"
+  },
+  "properties": {
+    "correlation_id": "child-task-id",
+    "reply_to": "reply-queue"
+  }
+}

@@ -38,6 +38,7 @@ from celery.utils.text import remove_repeating_from_task, truncate
 __all__ = (
     'Signature', 'chain', 'xmap', 'xstarmap', 'chunks',
     'group', 'chord', 'signature', 'maybe_signature',
+    'HeaderPropagation', 'get_header_propagation',
 )
 
 
@@ -130,6 +131,113 @@ def _merge_dictionaries(d1, d2, aggregate_duplicates=True):
         if key not in d1:
             d1[key] = value
 
+
+class HeaderPropagation:
+    """Strategy for propagating headers from parent to child signatures in canvas.
+
+    Only keys present in the allowlist can propagate from a parent signature
+    to its children.  A child signature's explicit values always take priority
+    over propagated values.  Celery internal reserved keys are never overridden
+    by business propagation.
+
+    The propagation follows real child relationships:
+
+    - ``chain``: each task is a child of the previous task.
+    - ``group``: all tasks are children of the group.
+    - ``chord``: the header tasks and the body are children of the chord.
+
+    Source headers and signatures are never modified in-place; a new dict is
+    returned by :meth:`propagate`.
+
+    Arguments:
+        allowed_keys (Iterable[str]): Keys that are allowed to propagate.
+        reserved_keys (Iterable[str]): Keys that cannot be overridden by
+            business propagation.  Defaults to :attr:`RESERVED_KEYS`.
+    """
+
+    # Celery internal reserved keys that cannot be overridden by business
+    # propagation.  These are protocol-level fields managed by Celery itself.
+    RESERVED_KEYS = frozenset({
+        'task_id', 'group_id', 'chord', 'root_id', 'parent_id',
+        'group_index', 'reply_to', 'chain', 'link', 'link_error',
+        'stamped_headers',
+    })
+
+    def __init__(self, allowed_keys=None, reserved_keys=None):
+        self.allowed_keys = set(allowed_keys) if allowed_keys else set()
+        self.reserved_keys = (
+            set(reserved_keys) if reserved_keys is not None
+            else set(self.RESERVED_KEYS)
+        )
+
+    def propagate(self, parent_headers, child_options):
+        """Propagate allowed headers from parent to child.
+
+        Only allowed keys propagate.  A child's explicit value takes priority
+        over the parent's value.  Reserved keys are never overridden.  Neither
+        the parent headers nor the child options are modified.
+
+        The parent headers are read from ``parent_options['headers']`` if
+        ``parent_headers`` is a signature options dict, otherwise directly
+        from ``parent_headers``.  The child's existing headers are read from
+        ``child_options['headers']``.
+
+        Arguments:
+            parent_headers (Mapping): Headers from the parent signature, or
+                the parent's options dict (in which case the ``headers`` key
+                is used).
+            child_options (Mapping): Options from the child signature.
+
+        Returns:
+            Dict: A new dict of headers to add to the child.
+        """
+        # Support being passed a signature options dict directly.
+        if 'headers' in parent_headers and isinstance(parent_headers.get('headers'), dict):
+            parent_headers = parent_headers['headers']
+        child_headers = child_options.get('headers', {}) or {}
+        result = {}
+        for key, value in parent_headers.items():
+            if key in self.reserved_keys:
+                # Protocol fields are never overridden by business propagation.
+                continue
+            if key not in self.allowed_keys:
+                continue
+            if key in child_headers:
+                # Child's explicit value takes priority.
+                continue
+            result[key] = value
+        return result
+
+    def apply(self, parent_headers, child_options):
+        """Like :meth:`propagate`, but merges the result into child_options.
+
+        A new dict is returned; the source mappings are not modified.
+        """
+        propagated = self.propagate(parent_headers, child_options)
+        child_headers = child_options.get('headers', {}) or {}
+        merged_headers = {**child_headers, **propagated}
+        return {**child_options, 'headers': merged_headers}
+
+
+# Global default header propagation strategy.  Configure the allowlist via
+# the ``task_header_propagation_allowlist`` setting, or replace this instance
+# with a custom :class:`HeaderPropagation` subclass.
+_default_header_propagation = HeaderPropagation()
+
+
+def get_header_propagation(app=None):
+    """Return the configured :class:`HeaderPropagation` strategy.
+
+    Reads the ``task_header_propagation_allowlist`` setting from the app
+    configuration.  If the setting is not configured, returns the global
+    default instance (which has an empty allowlist, so nothing propagates).
+    """
+    if app is None:
+        app = current_app
+    allowlist = app.conf.get('task_header_propagation_allowlist', None)
+    if allowlist:
+        return HeaderPropagation(allowed_keys=allowlist)
+    return _default_header_propagation
 
 class StampingVisitor(metaclass=ABCMeta):
     """Stamping API.  A class that provides a stamping API possibility for
@@ -1271,6 +1379,15 @@ class _chain(Signature):
                 steps_extend(task.tasks)
                 continue
 
+            # Propagate headers from the previous (parent) task to this
+            # (child) task.  Only allowed keys propagate; the child's own
+            # explicit values take priority; reserved protocol fields are
+            # never overridden.  The task is a clone at this point, so the
+            # source signature is not modified in-place.
+            if prev_task is not None:
+                propagation = get_header_propagation(app)
+                task.options = propagation.apply(prev_task.options, task.options)
+
             # TODO why isn't this asserting is_last_task == False?
             if isinstance(task, group) and prev_task:
                 # automatically upgrade group(...) | s to chord(group, s)
@@ -1353,16 +1470,28 @@ class _chain(Signature):
         kwargs = kwargs if kwargs else {}
         last, (fargs, fkwargs) = None, (args, kwargs)
         tasks = list(self.tasks)
+        prev_task = None
         for index, task in enumerate(tasks):
             if _is_empty_group(task) and (
                     index < len(tasks) - 1 or last is not None):
                 # Skip empty groups, mirroring _chain.prepare_steps:
                 # an empty group is a no-op, unless it is the only task.
                 continue
-            res = task.clone().apply(
+            # Clone the task first so the source signature is not modified
+            # in-place by header propagation.
+            task = task.clone()
+            # Propagate headers from the previous (parent) task to this
+            # (child) task.  Only allowed keys propagate; the child's own
+            # explicit values take priority; reserved protocol fields are
+            # never overridden.
+            if prev_task is not None:
+                propagation = get_header_propagation(self.app)
+                task.options = propagation.apply(prev_task.options, task.options)
+            res = task.apply(
                 (last.get(),) if last else fargs, fkwargs,
                 **dict(self.options, **options))
             res.parent, last, (fargs, fkwargs) = last, res, (None, None)
+            prev_task = task
             if isinstance(res, EagerResult) and res.state in (IGNORED, REJECTED):
                 break
         return last
@@ -1723,8 +1852,10 @@ class group(Signature):
             return self.freeze()  # empty group returns GroupResult
         options, group_id, root_id = self._freeze_gid(options)
         tasks = self._prepared(self.tasks, [], group_id, root_id, app)
+        # Don't pass headers as options; they are propagated in _prepared.
+        apply_options = {k: v for k, v in options.items() if k != 'headers'}
         return app.GroupResult(group_id, [
-            sig.apply(args=args, kwargs=kwargs, **options) for sig, _, _ in tasks
+            sig.apply(args=args, kwargs=kwargs, **apply_options) for sig, _, _ in tasks
         ])
 
     def set_immutable(self, immutable):
@@ -1816,6 +1947,11 @@ class group(Signature):
                 # serialized sigs must be converted to Signature.
                 task = from_dict(task, app=app)
             if isinstance(task, group):
+                # Propagate headers from this group to the nested group
+                # before recursing, so the nested group's children inherit
+                # the propagated headers.
+                propagation = get_header_propagation(app)
+                task.options = propagation.apply(self.options, task.options)
                 # needs yield_from :(
                 unroll = task._prepared(
                     task.tasks, partial_args, group_id, root_id, app,
@@ -1827,6 +1963,13 @@ class group(Signature):
                 # (Issue #9772)
                 continue
             else:
+                # Propagate headers from this group to the task.
+                # Only allowed keys propagate; the task's own explicit
+                # values take priority; reserved protocol fields are never
+                # overridden.  The task is a clone at this point, so the
+                # source signature is not modified in-place.
+                propagation = get_header_propagation(app)
+                task.options = propagation.apply(self.options, task.options)
                 if partial_args and not task.immutable:
                     task.args = tuple(partial_args) + tuple(task.args)
                 yield task, task.freeze(group_id=group_id, root_id=root_id, group_index=index), group_id
@@ -1882,7 +2025,7 @@ class group(Signature):
                     app.backend.set_chord_size(group_id, chord_size)
                 sig.apply_async(producer=producer, add_to_parent=False,
                                 chord=chord_obj, args=args, kwargs=kwargs,
-                                **options)
+                                **{k: v for k, v in options.items() if k != 'headers'})
                 # adding callback to result, such that it will gradually
                 # fulfill the barrier.
                 #
@@ -2260,6 +2403,14 @@ class _chord(Signature):
         body = self.body if body is None else body
         tasks = (self.tasks.clone() if isinstance(self.tasks, group)
                  else group(self.tasks, app=self.app))
+        # Clone the body so the source signature is not modified in-place.
+        body = body.clone()
+        # Propagate headers from the chord to the header (group) and body.
+        # Only allowed keys propagate; the child's own explicit values take
+        # priority; reserved protocol fields are never overridden.
+        propagation = get_header_propagation(self.app)
+        body.options = propagation.apply(self.options, body.options)
+        tasks.options = propagation.apply(self.options, tasks.options)
         return body.apply(
             args=(tasks.apply(args, kwargs).get(propagate=propagate),),
         )
@@ -2332,6 +2483,15 @@ class _chord(Signature):
             options.pop('task_id', None)
             body.options.update(options)
 
+        # Propagate headers from the chord to the header (group) and body.
+        # Only allowed keys propagate; the child's own explicit values take
+        # priority; reserved protocol fields are never overridden.  The
+        # header and body are clones at this point, so the source signature
+        # is not modified in-place.
+        propagation = get_header_propagation(app)
+        body.options = propagation.apply(self.options, body.options)
+        header.options = propagation.apply(self.options, header.options)
+
         body_task_id = task_id or uuid()
         bodyres = body.freeze(body_task_id, group_id=group_id, root_id=root_id)
 
@@ -2351,7 +2511,9 @@ class _chord(Signature):
                 countdown=countdown,
                 max_retries=max_retries,
             )
-            header_result = header.apply_async(partial_args, kwargs, task_id=group_id, **options)
+            # Don't pass headers as options; they are propagated above.
+            apply_options = {k: v for k, v in options.items() if k != 'headers'}
+            header_result = header.apply_async(partial_args, kwargs, task_id=group_id, **apply_options)
         # The execution of a chord body is normally triggered by its header's
         # tasks completing. If the header is empty this will never happen, so
         # we execute the body manually here.

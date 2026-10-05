@@ -1,0 +1,13 @@
+{
+  "id": "child-task-id",
+  "task": "tasks.add",
+  "args": [
+    3
+  ],
+  "kwargs": {},
+  "headers": {},
+  "properties": {
+    "correlation_id": "child-task-id",
+    "reply_to": "reply-queue"
+  }
+}
