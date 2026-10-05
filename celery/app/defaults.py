@@ -321,6 +321,7 @@ NAMESPACES = Namespace(
         ),
         store_errors_even_if_ignored=Option(False, type='bool'),
         track_started=Option(False, type='bool'),
+        track_lineage=Option(False, type='bool'),
         allow_error_cb_on_chord_header=Option(False, type='bool'),
     ),
     worker=Namespace(

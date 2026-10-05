@@ -563,6 +563,30 @@ are either pending, finished, or waiting to be retried. Having a 'started'
 state can be useful for when there are long running tasks and there's a
 need to report what task is currently running.
 
+.. setting:: task_track_lineage
+
+``task_track_lineage``
+~~~~~~~~~~~~~~~~~~~~~~
+
+.. versionadded:: 5.7
+
+Default: Disabled.
+
+If :const:`True`, task messages carry an optional logical call lineage
+record in the ``lineage`` message header.  The record is created when a
+message is generated and contains the logical call identity, the parent
+call identity, a zero-based attempt number, and the origin type
+(``'new'``, ``'retry'`` or ``'chain'``) -- never argument values.
+
+Retries continue the identity of the original logical call (attempts
+0, 1, 2, ...), the next item of a chain starts an independent child
+call, and broker redelivery of the same message does not increase the
+attempt number.  Workers observing inconsistent records (attempt
+regression or parent identity mismatch) only log diagnostics; message
+acknowledgement and retry counts are unaffected.
+
+See :ref:`message-protocol-task-v2` for the exact field layout.
+
 .. setting:: task_time_limit
 
 ``task_time_limit``

@@ -5,6 +5,7 @@ from kombu.asynchronous.timer import to_timestamp
 
 from celery import signals
 from celery.app import trace as _app_trace
+from celery.app.lineage import observe_message_lineage
 from celery.exceptions import InvalidTaskError
 from celery.utils.imports import symbol_by_name
 from celery.utils.log import get_logger
@@ -148,6 +149,21 @@ def default(task, app, consumer,
             eventer=eventer, task=task, connection_errors=connection_errors,
             body=body, headers=headers, decoded=decoded, utc=utc,
         )
+        if app.conf.task_track_lineage:
+            # Observe the optional logical call lineage of this message.
+            # This is purely a side-channel: diagnostics are logged but
+            # never influence acknowledgement or retry bookkeeping.
+            try:
+                for _lineage_diag in observe_message_lineage(
+                        app.lineage_tracker, req.request_dict,
+                        redelivered=req.delivery_info.get(
+                            'redelivered', False)):
+                    logger.warning(
+                        'Task lineage diagnostic %s: %s (task id=%s)',
+                        _lineage_diag.code, _lineage_diag.message, req.id)
+            except Exception:
+                logger.exception(
+                    'Unexpected error while observing task lineage')
         if _does_info:
             # Similar to `app.trace.info()`, we pass the formatting args as the
             # `extra` kwarg for custom log handlers

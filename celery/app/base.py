@@ -1117,6 +1117,9 @@ class Celery:
         stamped_headers = options.pop('stamped_headers', [])
         for stamp in stamped_headers:
             options.pop(stamp)
+        # 'lineage' is consumed by create_task_message (recorded in the
+        # message headers); it must not leak into the publish options.
+        options.pop('lineage', None)
 
         if connection:
             producer = amqp.Producer(connection, auto_declare=False)
@@ -1636,6 +1639,16 @@ class Celery:
     def amqp(self):
         """AMQP related functionality: :class:`~@amqp`."""
         return instantiate(self.amqp_cls, app=self)
+
+    @cached_property
+    def lineage_tracker(self):
+        """Process-local registry of observed logical call lineage.
+
+        See :mod:`celery.app.lineage`.  Only used when
+        :setting:`task_track_lineage` is enabled.
+        """
+        from celery.app.lineage import LineageTracker
+        return LineageTracker()
 
     @property
     def _backend(self):

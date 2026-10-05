@@ -51,6 +51,7 @@ Definition
         'origin': str nodename,
         'replaced_task_nesting': int,
         'compression': string compression_method (optional; omitted when no compression is used, matches kombu compressor names such as 'zlib', 'bzip2', 'gzip'),
+        'lineage': Mapping call_lineage (optional, see "Logical call lineage" below),
     }
 
     body = (
@@ -63,6 +64,45 @@ Definition
             'chord': Signature chord_callback,
         }
     )
+
+Logical call lineage
+~~~~~~~~~~~~~~~~~~~~
+
+The optional ``lineage`` header records which *logical call* a message
+belongs to, so that retries of one task, the next item of a canvas
+chain, and broker redeliveries can be told apart without guessing from
+the task id.  It is only emitted when the
+:setting:`task_track_lineage` setting is enabled, and it never contains
+argument values -- only call identities and counters:
+
+.. code-block:: python
+
+    headers['lineage'] = {
+        # identity of the logical call this message belongs to;
+        # a retry keeps the call_id of the original message, while the
+        # next item of a chain gets a new child call_id.
+        'call_id': string call_id,
+
+        # identity of the logical call this call was spawned from
+        # (e.g. the chain step that completed before this one),
+        # or None for root calls.
+        'parent_call_id': string parent_call_id or None,
+
+        # zero-based attempt number of the logical call: the first
+        # message is attempt 0 and every retry continues the same
+        # logical call with attempt + 1.  Broker redelivery of the
+        # same message does not create a new attempt.
+        'attempt': int attempt,
+
+        # how this message was generated:
+        # 'new' (fresh call), 'retry' or 'chain'.
+        'origin': string origin,
+    }
+
+Consumers may observe these records to detect anomalies (attempt
+regression, parent identity mismatch) as diagnostics only; such
+diagnostics must not change message acknowledgement or retry
+bookkeeping.
 
 Example
 ~~~~~~~

@@ -9,6 +9,7 @@ from kombu.utils.uuid import uuid
 
 from celery import current_app, states
 from celery._state import _task_stack
+from celery.app.lineage import CallLineage, retry_lineage
 from celery.canvas import _chain, group, signature
 from celery.exceptions import Ignore, ImproperlyConfigured, MaxRetriesExceededError, Reject, Retry
 from celery.local import class_property
@@ -95,6 +96,7 @@ class Context:
     ignore_result = False
     is_eager = False
     kwargs = None
+    lineage = None
     logfile = None
     loglevel = None
     origin = None
@@ -691,6 +693,11 @@ class Task:
             options.setdefault('priority', self.priority)
 
         app = self._get_app()
+        if app.conf.task_track_lineage and options.get('lineage') is None:
+            # Record the logical call this message belongs to.  Retries
+            # and chain items pass their own lineage explicitly, so only
+            # fresh calls get a new identity here.
+            options['lineage'] = CallLineage.new_call().to_dict()
         if app.conf.task_always_eager:
             with app.producer_or_acquire(producer) as eager_producer:
                 serializer = options.get('serializer')
@@ -848,6 +855,11 @@ class Task:
             countdown=countdown, eta=eta, retries=retries,
             **options
         )
+        if self._get_app().conf.task_track_lineage:
+            # A retry continues the identity of the original logical
+            # call and only increments the attempt number.
+            S.options['lineage'] = retry_lineage(
+                request.get('lineage'), retries).to_dict()
 
         if max_retries is not None and retries > max_retries:
             if exc:

@@ -18,6 +18,7 @@ from kombu.utils.encoding import safe_repr, safe_str
 
 from celery import current_app, group, signals, states
 from celery._state import _task_stack
+from celery.app.lineage import chain_child_lineage
 from celery.app.task import Context
 from celery.app.task import Task as BaseTask
 from celery.exceptions import BackendGetMetaError, Ignore, InvalidTaskError, Reject, Retry
@@ -425,6 +426,7 @@ def build_tracer(name, task, loader=None, hostname=None, store_errors=True,
 
     def _dispatch_callbacks_and_chain(
         retval, callbacks, chain, parent_id, root_id, priority,
+        lineage=None,
     ):
         """Dispatch callbacks and chain for a completed task.
 
@@ -466,10 +468,17 @@ def build_tracer(name, task, loader=None, hostname=None, store_errors=True,
                 )
         if chain:
             _chsig = signature(chain[-1], app=app)
+            _chain_options = {}
+            if app.conf.task_track_lineage:
+                # The next chain item is an independent child call of
+                # the logical call that just completed.
+                _chain_options['lineage'] = chain_child_lineage(
+                    lineage).to_dict()
             _chsig.apply_async(
                 (retval,), chain=chain[:-1],
                 parent_id=parent_id, root_id=root_id,
                 priority=priority,
+                **_chain_options,
             )
 
     def trace_task(uuid, args, kwargs, request=None):
@@ -542,6 +551,7 @@ def build_tracer(name, task, loader=None, hostname=None, store_errors=True,
                                     stored_retval, _callbacks, _chain,
                                     parent_id=uuid, root_id=_root_id,
                                     priority=_priority,
+                                    lineage=task_request.get('lineage'),
                                 )
                             successful_requests.add(task_request.id)
                         except MemoryError:
@@ -621,6 +631,7 @@ def build_tracer(name, task, loader=None, hostname=None, store_errors=True,
                             task_request.chain,
                             parent_id=uuid, root_id=root_id,
                             priority=task_priority,
+                            lineage=task_request.get('lineage'),
                         )
                         task.backend.mark_as_done(
                             uuid, retval, task_request, publish_result,

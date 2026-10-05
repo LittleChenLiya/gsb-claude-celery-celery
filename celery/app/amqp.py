@@ -332,7 +332,7 @@ class AMQP:
                    create_sent_event=False, root_id=None, parent_id=None,
                    shadow=None, chain=None, now=None, timezone=None,
                    origin=None, ignore_result=False, argsrepr=None, kwargsrepr=None, stamped_headers=None,
-                   replaced_task_nesting=0, **options):
+                   replaced_task_nesting=0, lineage=None, **options):
 
         args = args or ()
         kwargs = kwargs or {}
@@ -390,6 +390,14 @@ class AMQP:
             'stamped_headers': stamped_headers,
             'stamps': stamps,
         }
+        if lineage is not None:
+            # Optional logical call lineage record (see
+            # :mod:`celery.app.lineage`).  Only identities and counters
+            # are stored -- never argument values.
+            headers['lineage'] = (
+                lineage.to_dict() if hasattr(lineage, 'to_dict')
+                else dict(lineage)
+            )
 
         return task_message(
             headers=headers,
